@@ -246,7 +246,8 @@ def _extract_cache(rel: str) -> Path:
 def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
     """A PDF's own text layer, the page map, and the reason the layer is empty
     when it is. Cached beside the index (`.txt` with the text, `.json` with the
-    map) and re-extracted whenever the PDF is newer than the cache.
+    map) and re-extracted whenever the source's identity stamp moves — the
+    manifest's stamp when `SILICA_INVENTORY` supplies one, else the PDF's mtime.
 
     The page is the section: search ranks pages, `silica_read` serves one by
     `p. N`, `page_map` carries a slice back to its pages. The map is kept
@@ -261,7 +262,19 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
     """
     cache = _extract_cache(rel)
     pages_file = cache.with_suffix(".json")
-    stamp = _identity_stamp(rel, full)
+    stamps = _manifest_stamps()
+    stamp = _identity_stamp(rel, full, stamps)
+    # A manifest's stamp is the source's real identity. A bare-list artifact
+    # written before the stamp field existed carries none of its own, so it
+    # cannot be held to that stamp: its cache file is written locally, so on a
+    # `--no-modtime` mount its mtime looks newer however constant the source's
+    # is, and reusing it would serve a replaced PDF's old text and page bounds.
+    # When the manifest has a stamp for the document the artifact is therefore
+    # a miss, and the re-extraction that follows rewrites it in the stamped
+    # form. With no manifest stamp the identity is the filesystem's own, and
+    # the artifact is honoured by the mtime comparison it was written under —
+    # upstream's behaviour, unchanged.
+    legacy_held_to_stamp = bool(stamps) and rel in stamps
     try:
         payload = orjson.loads(pages_file.read_bytes())
         if isinstance(payload, dict) and "pages" in payload:
@@ -270,9 +283,12 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
             if payload.get("stamp") == stamp:
                 text = cache.read_text(encoding="utf-8", errors="replace")
                 return text, payload["pages"], "" if text else "no text layer"
-        elif isinstance(payload, list) and cache.stat().st_mtime >= full.stat().st_mtime:
+        elif isinstance(payload, list) and not legacy_held_to_stamp \
+                and cache.stat().st_mtime >= full.stat().st_mtime:
             # A cache written before the field existed (a bare page array):
-            # fall back to the mtime comparison it was written under.
+            # fall back to the mtime comparison it was written under, but only
+            # when no manifest stamp exists to hold it to. A stamp the bare
+            # list cannot record makes it a miss rather than a stale read.
             text = cache.read_text(encoding="utf-8", errors="replace")
             return text, payload, "" if text else "no text layer"
     except (OSError, ValueError):
@@ -599,7 +615,7 @@ def _manifest_stamps() -> dict[str, float] | None:
     return manifest["stamps"] if manifest is not None else None
 
 
-def _identity_stamp(rel: str, full: Path) -> float | int:
+def _identity_stamp(rel: str, full: Path, stamps: dict[str, float] | None = None) -> float | int:
     """A document's identity for the in-process caches: the manifest's stamp for
     `rel` when `SILICA_INVENTORY` supplies one, else the filesystem's own
     `st_mtime_ns`. Every cache that used to key on `stat().st_mtime` calls this,
@@ -610,9 +626,13 @@ def _identity_stamp(rel: str, full: Path) -> float | int:
     value is the one the caches already used, so behaviour is unchanged.
 
     Inside a public call that resolved the manifest once (`_manifest_scoped`),
-    the stamp comes from that parse; outside one, this resolves it per call.
+    the stamp comes from that parse; outside one, this resolves it per call. A
+    caller that already has the manifest's `stamps` map (the extraction cache,
+    which also has to know whether the document carries a stamp at all) passes
+    it as `stamps` so the manifest is read once, not twice.
     """
-    stamps = _manifest_stamps()
+    if stamps is None:
+        stamps = _manifest_stamps()
     if stamps:
         stamp = stamps.get(rel)
         if stamp is not None:

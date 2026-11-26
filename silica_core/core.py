@@ -164,17 +164,22 @@ def _source_state(original: Path, sidecar_text: str) -> str:
         return "unverifiable"
 
 
-_sha_cache: dict[tuple[str, int, int], str] = {}
+_sha_cache: dict[tuple[str, float | int, int], str] = {}
 
 
 def _sha256_of(full: Path) -> str:
-    """The file's sha256, kept per (path, mtime, size): every search hit on
-    a converted note asks for its original's, and a 40 MB PDF is a 40 MB
-    read plus 16 ms of hashing (measured 2026-11-04) per hit. A replaced
-    file moves its mtime or size, so a stale verdict is never served from
-    here."""
+    """The file's sha256, kept per (path, identity stamp, size): every search
+    hit on a converted note asks for its original's, and a 40 MB PDF is a 40 MB
+    read plus 16 ms of hashing (measured 2026-11-04) per hit. The stamp is the
+    document's identity (a manifest's, when one is set), so a replaced file that
+    the filesystem reports as unchanged — same mtime on a `--no-modtime` mount —
+    still misses here rather than serving a stale verdict."""
     st = full.stat()
-    key = (str(full), st.st_mtime_ns, st.st_size)
+    try:
+        stamp: float | int = _identity_stamp(_rel(str(full)), full)
+    except ValueError:  # outside the root: fall back to the filesystem's own stamp
+        stamp = st.st_mtime_ns
+    key = (str(full), stamp, st.st_size)
     if key not in _sha_cache:
         if len(_sha_cache) > 512:
             _sha_cache.clear()
@@ -244,10 +249,20 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
     """
     cache = _extract_cache(rel)
     pages_file = cache.with_suffix(".json")
+    stamp = _identity_stamp(rel, full)
     try:
-        if cache.stat().st_mtime >= full.stat().st_mtime:
+        payload = orjson.loads(pages_file.read_bytes())
+        if isinstance(payload, dict) and "pages" in payload:
+            # A cache written with this build: the source's identity is beside
+            # the pages, so a replaced file misses however constant its mtime is.
+            if payload.get("stamp") == stamp:
+                text = cache.read_text(encoding="utf-8", errors="replace")
+                return text, payload["pages"], "" if text else "no text layer"
+        elif isinstance(payload, list) and cache.stat().st_mtime >= full.stat().st_mtime:
+            # A cache written before the field existed (a bare page array):
+            # fall back to the mtime comparison it was written under.
             text = cache.read_text(encoding="utf-8", errors="replace")
-            return text, orjson.loads(pages_file.read_bytes()), "" if text else "no text layer"
+            return text, payload, "" if text else "no text layer"
     except (OSError, ValueError):
         pass
     try:
@@ -282,7 +297,7 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
     text = "".join(parts) if any(bodies) else ""
     cache.parent.mkdir(parents=True, exist_ok=True)
     _paths.atomic_write_bytes(cache, text.encode("utf-8"))
-    _paths.atomic_write_bytes(pages_file, orjson.dumps(pages if text else []))
+    _paths.atomic_write_bytes(pages_file, orjson.dumps({"stamp": stamp, "pages": pages if text else []}))
     return text, (pages if text else []), "" if text else "no text layer"
 
 
@@ -396,6 +411,23 @@ def _manifest_inventory() -> tuple[dict[str, float], list[str]] | None:
         return None
     unextracted = data.get("unextracted")
     return dict(sorted(stamps.items())), [str(rel) for rel in unextracted] if isinstance(unextracted, list) else []
+
+
+def _identity_stamp(rel: str, full: Path) -> float | int:
+    """A document's identity for the in-process caches: the manifest's stamp for
+    `rel` when `SILICA_INVENTORY` supplies one, else the filesystem's own
+    `st_mtime_ns`. Every cache that used to key on `stat().st_mtime` calls this,
+    so the three agree on what "the same document" means. The stamp is compared
+    for equality only; on a mount whose mtime is constant (`--no-modtime`) the
+    filesystem's stamp never moves, so only a manifest that carries a content
+    digest can tell a replaced file from an untouched one. With no manifest the
+    value is the one the caches already used, so behaviour is unchanged."""
+    manifest = _manifest_inventory()
+    if manifest is not None:
+        stamp = manifest[0].get(rel)
+        if stamp is not None:
+            return stamp
+    return full.stat().st_mtime_ns
 
 
 def _inventory(base: Path | None = None) -> tuple[dict[str, float], list[str]]:
@@ -799,18 +831,19 @@ def _iso(ts: float) -> str:
 # 2. search
 # ---------------------------------------------------------------------------
 
-_section_cache: dict[tuple[str, float], tuple[str, list[tuple[int, str, Counter, int, str]]]] = {}
+_section_cache: dict[tuple[str, float | int], tuple[str, list[tuple[int, str, Counter, int, str]]]] = {}
 
 
 def _sections_of(key: str) -> tuple[str, list[tuple[int, str, Counter, int, str]]]:
     """Text and (offset, section, term counts, length, title) per section — a
     heading section in a note, a page in a PDF, a symbol in a source file —
-    cached by mtime so a second query over the same top documents does not
-    retokenize (nor re-extract). For a unit key (`path#offset`) the one unit,
+    cached by identity stamp so a second query over the same top documents does
+    not retokenize (nor re-extract), and a document replaced in place is not
+    served from the cache. For a unit key (`path#offset`) the one unit,
     with the whole file's text, so a line is counted from the file's start."""
     rel, unit = _split_key(key)
     full = _root() / rel
-    stamp = (rel, full.stat().st_mtime)
+    stamp = (rel, _identity_stamp(rel, full))
     if stamp not in _section_cache:
         if full.suffix.lower() == ".pdf":
             text, pages, _reason = _pdf_text(rel, full)

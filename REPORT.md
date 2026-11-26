@@ -1,5 +1,10 @@
 # Robust index pass
 
+Branch `feat/robust-index`, cut from the process-parallel pass and its
+batching/timeout patch (both are off `atkar/main`): the crash isolation in
+section 2 replaces that pass's pool handling, and the batch boundary in
+section 4 is the `SILICA_INDEX_BATCH` generation that patch introduced.
+
 A first index pass over a large corpus must survive one pathological document
 and must not rewrite the whole store while it runs. This branch lands four
 changes; each names the failure it prevents and the test that proves it.

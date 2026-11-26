@@ -373,14 +373,46 @@ def _notes() -> dict[str, float]:
     return _inventory()[0]
 
 
+def _manifest_inventory() -> tuple[dict[str, float], list[str]] | None:
+    """The inventory from `SILICA_INVENTORY`, a JSON file
+    `{"stamps": {rel: number}, "unextracted": [rel, ...]}`, or None when the
+    variable is unset, unreadable or malformed: where a corpus lives is worth
+    an optimisation, never a failure, so anything the walk can still answer
+    falls back to the walk. The stamp is the number the index compares for
+    equality against the one it stored, so it may be an mtime or a digest of
+    the content — only the latter gives real change detection behind a mount
+    that reports a parent-directory mtime. A caller hashing content keeps the
+    value exact in a float by using the first 12 hex digits (48 bits, well
+    inside a double). The order of `stamps` is not significant: the rows are
+    sorted here, as `_inventory` sorts its own.
+    """
+    raw = os.environ.get("SILICA_INVENTORY", "").strip()
+    if not raw:
+        return None
+    try:
+        data = orjson.loads(Path(raw).read_bytes())
+        stamps = {str(rel): float(mt) for rel, mt in data["stamps"].items()}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    unextracted = data.get("unextracted")
+    return dict(sorted(stamps.items())), [str(rel) for rel in unextracted] if isinstance(unextracted, list) else []
+
+
 def _inventory(base: Path | None = None) -> tuple[dict[str, float], list[str]]:
     """`_notes()` and, from the same walk, the documents the index holds no
     text for because nothing extracted it: an office file, an e-book, a
     recording with no `.md` beside it, which `silica_files` calls
     `unconverted`. A search needs both, and a second walk for the count was
     paid on every call (0.032 s on 3,202 files, silica-agent's own walk on
-    alex_second_brain, 2026-11-04)."""
+    alex_second_brain, 2026-11-04). `SILICA_INVENTORY` replaces the walk with
+    a manifest when the caller already knows what the corpus holds; a `base`
+    is always walked, since a manifest describes a whole root."""
     from silica_core.sources.convert import DOC_EXTS, IMG_EXTS
+
+    if base is None:
+        manifest = _manifest_inventory()
+        if manifest is not None:
+            return manifest
 
     out: dict[str, float] = {}
     unextracted: list[str] = []

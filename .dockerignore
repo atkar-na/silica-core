@@ -5,7 +5,7 @@
 !pyproject.toml
 !README.md
 !LICENSE
-!silica/
+!silica_core/
 # setuptools-scm reads it in the build stage to derive the version; without it
 # the wheel installs as pyproject's fallback_version, 0.0.0, and the image can no
 # longer say which build it is. Costs ~115 MB of context. If that matters more

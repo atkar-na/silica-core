@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, Callable
 
@@ -164,22 +165,36 @@ def _source_state(original: Path, sidecar_text: str) -> str:
         return "unverifiable"
 
 
-_sha_cache: dict[tuple[str, int, int], str] = {}
+def _digest_stamp(digest: str) -> float:
+    """The manifest and in-process identity both use the first 12 hex digits."""
+    hex_digest = digest.lower()
+    if hex_digest.startswith("sha256:"):
+        hex_digest = hex_digest[len("sha256:"):]
+    hex_digits = hex_digest[:12]
+    if len(hex_digits) != 12 or any(c not in "0123456789abcdef" for c in hex_digits):
+        raise ValueError("digest must contain 12 hexadecimal digits")
+    return float(int(hex_digits, 16))
+
+
+_sha_cache: dict[tuple[str, str], str] = {}
 
 
 def _sha256_of(full: Path) -> str:
-    """The file's sha256, kept per (path, mtime, size): every search hit on
-    a converted note asks for its original's, and a 40 MB PDF is a 40 MB
-    read plus 16 ms of hashing (measured 2026-11-04) per hit. A replaced
-    file moves its mtime or size, so a stale verdict is never served from
-    here."""
-    st = full.stat()
-    key = (str(full), st.st_mtime_ns, st.st_size)
+    """The file's sha256, kept per (path, digest): every search hit on a
+    converted note asks for its original, and the mount's mtime is never
+    allowed to make a replacement look untouched."""
+    digest = hashlib.sha256(full.read_bytes()).hexdigest()
+    key = (str(full), digest)
     if key not in _sha_cache:
         if len(_sha_cache) > 512:
             _sha_cache.clear()
-        _sha_cache[key] = hashlib.sha256(full.read_bytes()).hexdigest()
+        _sha_cache[key] = digest
     return _sha_cache[key]
+
+
+def _document_stamp(full: Path) -> float:
+    """The content identity stamp used by caches and manifests."""
+    return _digest_stamp(_sha256_of(full))
 
 
 def _conversion_of(md_full: Path, text: str) -> tuple[str | None, str | None]:
@@ -229,7 +244,8 @@ def _extract_cache(rel: str) -> Path:
 def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
     """A PDF's own text layer, the page map, and the reason the layer is empty
     when it is. Cached beside the index (`.txt` with the text, `.json` with the
-    map) and re-extracted whenever the PDF is newer than the cache.
+    map, `.stamp` with the content identity) and re-extracted whenever the
+    PDF's content identity changes.
 
     The page is the section: search ranks pages, `silica_read` serves one by
     `p. N`, `page_map` carries a slice back to its pages. The map is kept
@@ -244,11 +260,20 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
     """
     cache = _extract_cache(rel)
     pages_file = cache.with_suffix(".json")
+    stamp_file = cache.with_suffix(".stamp")
+    stamp: float | None
     try:
-        if cache.stat().st_mtime >= full.stat().st_mtime:
+        stamp = _document_stamp(full)
+    except OSError:
+        stamp = None
+    try:
+        cached_stamp = orjson.loads(stamp_file.read_bytes())
+        if isinstance(cached_stamp, bool) or not isinstance(cached_stamp, (int, float)):
+            raise ValueError("invalid extraction stamp")
+        if stamp is not None and float(cached_stamp) == stamp:
             text = cache.read_text(encoding="utf-8", errors="replace")
             return text, orjson.loads(pages_file.read_bytes()), "" if text else "no text layer"
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         pass
     try:
         import pypdfium2 as pdfium
@@ -283,6 +308,8 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
     cache.parent.mkdir(parents=True, exist_ok=True)
     _paths.atomic_write_bytes(cache, text.encode("utf-8"))
     _paths.atomic_write_bytes(pages_file, orjson.dumps(pages if text else []))
+    if stamp is not None:
+        _paths.atomic_write_bytes(stamp_file, orjson.dumps(stamp))
     return text, (pages if text else []), "" if text else "no text layer"
 
 
@@ -331,6 +358,27 @@ def _load_meta() -> dict:
     return meta
 
 
+def _digest_meta_path() -> Path:
+    return _paths.index_dir() / "digest-stamps.json"
+
+
+def _load_digest_meta() -> dict[str, float]:
+    """Persistent content identities supplement mtimes for manifests that are unset."""
+    try:
+        data = orjson.loads(_digest_meta_path().read_bytes())
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, float] = {}
+    for rel, stamp in data.items():
+        if isinstance(rel, str) and isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            stamp = float(stamp)
+            if math.isfinite(stamp):
+                out[rel] = stamp
+    return out
+
+
 def _failures() -> dict[str, str]:
     try:
         return orjson.loads((_paths.index_dir() / "failures.json").read_bytes())
@@ -366,10 +414,9 @@ def _walk(base: Path | None = None):
 
 
 def _notes() -> dict[str, float]:
-    """rel -> mtime for every document the index reads: notes, and PDFs with
-    no extracted `.md` beside them — that sidecar is the note, and indexing
-    both would double it. The one stat per file happens here, so
-    `index_state` and `build_index` given this dict never walk again."""
+    """rel -> identity stamp for every document the index reads: a manifest
+    stamp when one is set, otherwise the upstream mtime stamp. The walk still
+    supplies the same set and sidecar rules with no manifest."""
     return _inventory()[0]
 
 
@@ -391,11 +438,177 @@ def _manifest_inventory() -> tuple[dict[str, float], list[str]] | None:
         return None
     try:
         data = orjson.loads(Path(raw).read_bytes())
-        stamps = {str(rel): float(mt) for rel, mt in data["stamps"].items()}
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        if not isinstance(data, dict):
+            return None
+        raw_stamps = data["stamps"]
+        if not isinstance(raw_stamps, dict):
+            return None
+        raw_unextracted = data.get("unextracted", [])
+        if not isinstance(raw_unextracted, list):
+            return None
+        if not raw_stamps and not raw_unextracted:
+            return None
+        stamps: dict[str, float] = {}
+        for rel, mt in raw_stamps.items():
+            if not isinstance(rel, str) or isinstance(mt, bool) or not isinstance(mt, (int, float)):
+                return None
+            stamp = float(mt)
+            if not math.isfinite(stamp):
+                return None
+            stamps[rel] = stamp
+        unextracted = [rel for rel in raw_unextracted if isinstance(rel, str)]
+        if len(unextracted) != len(raw_unextracted):
+            return None
+    except (OSError, OverflowError, ValueError, TypeError, KeyError, AttributeError):
         return None
-    unextracted = data.get("unextracted")
-    return dict(sorted(stamps.items())), [str(rel) for rel in unextracted] if isinstance(unextracted, list) else []
+    return dict(sorted(stamps.items())), sorted(unextracted)
+
+
+def _listing_field(row: Any, *names: str) -> Any:
+    if isinstance(row, Mapping):
+        for name in names:
+            if name in row:
+                return row[name]
+    else:
+        for name in names:
+            if hasattr(row, name):
+                return getattr(row, name)
+    return None
+
+
+def _listing_rows(listing: Iterable[Any] | Mapping[str, Any]) -> list[Any]:
+    if isinstance(listing, Mapping):
+        for name in ("rows", "files"):
+            nested = listing.get(name)
+            if isinstance(nested, (list, tuple)):
+                return list(nested)
+        rows = []
+        for rel, row in listing.items():
+            if isinstance(row, Mapping):
+                data = dict(row)
+                data.setdefault("path", rel)
+            elif isinstance(row, str):
+                data = {"path": rel, "digest": row}
+            else:
+                data = {"path": rel, "stamp": row}
+            rows.append(data)
+        return rows
+    if isinstance(listing, (str, bytes)):
+        raise TypeError("listing must contain rows")
+    return list(listing)
+
+
+def _listing_rel(root: Path, raw: Any) -> str | None:
+    if not isinstance(raw, (str, Path)):
+        return None
+    text = str(raw).replace("\\", "/").strip()
+    if not text:
+        return None
+    path = Path(text)
+    if path.is_absolute():
+        try:
+            text = path.relative_to(root).as_posix()
+        except ValueError:
+            return None
+    if text.startswith("./"):
+        text = text[2:]
+    parts = text.split("/")
+    if not text or any(part in ("", ".", "..") for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _produce_inventory_manifest(
+    root: str | Path,
+    listing: Iterable[Any] | Mapping[str, Any],
+    destination: str | Path,
+) -> dict[str, Any]:
+    """Write the same document set `_inventory()` reads from a digest listing."""
+    root = Path(root).resolve()
+    all_rows = _listing_rows(listing)
+    all_rel = set()
+    for row in all_rows:
+        rel = _listing_rel(root, _listing_field(row, "path", "rel", "relative_path", "name", "key"))
+        if rel is not None:
+            all_rel.add(rel)
+
+    skip = _paths.ignore_path_matcher(root)
+    stamps: dict[str, float] = {}
+    unextracted: list[str] = []
+    for row in all_rows:
+        rel = _listing_rel(root, _listing_field(row, "path", "rel", "relative_path", "name", "key"))
+        if rel is None:
+            continue
+        parts = rel.split("/")
+        if any(part.startswith(".") for part in parts):
+            continue
+        if any(skip("/".join(parts[:i])) for i in range(1, len(parts))):
+            continue
+        if skip(rel):
+            continue
+
+        full = root / Path(*parts)
+        raw_size = _listing_field(row, "size", "bytes", "byte_size", "length")
+        try:
+            size = int(raw_size) if raw_size is not None else full.stat().st_size
+        except (OSError, TypeError, ValueError):
+            continue
+
+        raw_digest = _listing_field(
+            row, "digest", "sha256", "sha_256", "content_sha256", "content_digest", "hash", "stamp",
+        )
+        try:
+            if isinstance(raw_digest, str):
+                stamp = _digest_stamp(raw_digest)
+            elif isinstance(raw_digest, (int, float)) and not isinstance(raw_digest, bool):
+                stamp = float(raw_digest)
+                if not math.isfinite(stamp):
+                    continue
+            else:
+                stamp = _document_stamp(full)
+        except (OSError, ValueError, TypeError):
+            continue
+
+        suffix = full.suffix.lower()
+        stem = rel.rsplit(".", 1)[0] if "." in rel else rel
+        sidecar = stem + ".md"
+        has_sidecar = sidecar in all_rel or (root / sidecar).is_file()
+
+        if suffix in _PROSE_SUFFIXES:
+            stamps[rel] = stamp
+        elif suffix == ".pdf":
+            if not has_sidecar:
+                stamps[rel] = stamp
+        elif _is_code(rel):
+            if size <= _CODE_MAX_BYTES:
+                stamps[rel] = stamp
+        else:
+            from silica_core.sources.convert import DOC_EXTS, IMG_EXTS
+            if suffix in DOC_EXTS and suffix not in IMG_EXTS and not has_sidecar:
+                unextracted.append(rel)
+
+    manifest = {"stamps": dict(sorted(stamps.items())),
+                "unextracted": sorted(set(unextracted))}
+    output = Path(destination)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _paths.atomic_write_bytes(output, orjson.dumps(manifest))
+    return manifest
+
+
+def _write_inventory_manifest(
+    root: str | Path,
+    listing: Iterable[Any] | Mapping[str, Any],
+    destination: str | Path,
+) -> dict[str, Any]:
+    return _produce_inventory_manifest(root, listing, destination)
+
+
+def _manifest_from_listing(
+    root: str | Path,
+    listing: Iterable[Any] | Mapping[str, Any],
+    destination: str | Path,
+) -> dict[str, Any]:
+    return _produce_inventory_manifest(root, listing, destination)
 
 
 def _inventory(base: Path | None = None) -> tuple[dict[str, float], list[str]]:
@@ -509,20 +722,33 @@ def index_state(meta: dict | None = None, live: dict[str, float] | None = None) 
     live = _notes() if live is None else live
     stamps = meta.get("stamps", {})
     skipped = meta.get("no_text", {})
-    pending = sum(1 for r, mt in live.items()
-                  if stamps.get(r) != mt and skipped.get(r, {}).get("mtime") != mt)
+    manifest = _manifest_inventory()
+    digest_meta = _load_digest_meta() if manifest is None else {}
+    pending = 0
+    for r, mt in live.items():
+        mtime_changed = (stamps.get(r) != mt and skipped.get(r, {}).get("mtime") != mt)
+        digest_changed = False
+        if manifest is None and r in digest_meta:
+            try:
+                digest_changed = digest_meta[r] != _document_stamp(_root() / r)
+            except OSError:
+                digest_changed = True
+        if mtime_changed or digest_changed:
+            pending += 1
     pending += sum(1 for r in stamps if r not in live)
     return {"state": "stale" if pending else "ready", "docs": len(stamps),
             "built_at": meta.get("built_at"), "pending": pending}
 
 
-def _flush(store, meta: dict, failed: dict) -> None:
+def _flush(store, meta: dict, failed: dict, digest_stamps: dict[str, float] | None = None) -> None:
     """Everything the build knows so far, on disk: the store, the stamps with
     a `built_at` so the next run is incremental, the failures."""
     store.save()
     meta["built_at"] = time.time()
     _paths.atomic_write_bytes(_meta_path(), orjson.dumps(meta))
     _paths.atomic_write_bytes(_paths.index_dir() / "failures.json", orjson.dumps(failed))
+    if digest_stamps is not None:
+        _paths.atomic_write_bytes(_digest_meta_path(), orjson.dumps(digest_stamps))
     # The dir's name is a one-way digest of the root, so without this nothing
     # can tell which folder an index describes or that the folder is gone:
     # 343 of 549 dirs under ~/.silica/index on 2026-10-27. Not `vault.json`:
@@ -552,6 +778,24 @@ def build_index(rebuild: bool = False, embed: bool = False, live: dict[str, floa
         return _build_index(rebuild, embed, live, allow_remote, progress)
 
 
+def _guard_manifest_for_build(
+    live: dict[str, float],
+    unextracted: list[str],
+    meta: dict,
+) -> tuple[dict[str, float], list[str], bool]:
+    """A manifest never prunes the index unless it exactly describes the walk."""
+    manifest = _manifest_inventory()
+    if manifest is None:
+        return live, unextracted, False
+    try:
+        walk_live, walk_unextracted = _inventory(base=_root())
+    except Exception:
+        return dict(meta.get("stamps", {})), [], True
+    if set(live) != set(walk_live) or set(unextracted) != set(walk_unextracted):
+        return walk_live, walk_unextracted, False
+    return live, unextracted, False
+
+
 def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, float] | None = None,
                  allow_remote: bool = False, progress: Callable[[str, int, int], None] | None = None) -> dict:
     """Build or refresh the document index. Incremental by mtime; `rebuild`
@@ -572,14 +816,40 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         skipped: dict[str, dict] = meta.setdefault("no_text", {})
         units: dict[str, list[str]] = meta.setdefault("units", {})  # code file -> its unit keys
         root = _root()
-        live = _notes() if live is None else live
+        manifest = _manifest_inventory()
+        digest_meta = _load_digest_meta()
+        digest_stamps = {} if rebuild else dict(digest_meta)
+        if live is None:
+            live, unextracted = _inventory()
+        elif manifest is not None:
+            unextracted = manifest[1]
+        else:
+            unextracted = []
+        guarded = False
+        if manifest is not None:
+            live, unextracted, guarded = _guard_manifest_for_build(live, unextracted, meta)
         changed, failed = 0, {}
         last_flush = time.monotonic()
-        todo = [(rel, mt) for rel, mt in live.items()
-                if rebuild or not (stamps.get(rel) == mt or skipped.get(rel, {}).get("mtime") == mt)]
+        todo = []
+        if not guarded:
+            for rel, mt in live.items():
+                digest_changed = False
+                if manifest is None and rel in digest_meta:
+                    try:
+                        digest_changed = digest_meta[rel] != _document_stamp(root / rel)
+                    except OSError:
+                        digest_changed = True
+                if rebuild or digest_changed or not (
+                    stamps.get(rel) == mt or skipped.get(rel, {}).get("mtime") == mt
+                ):
+                    todo.append((rel, mt))
         for done, (rel, mt) in enumerate(todo, 1):
             if progress:
                 progress("index", done - 1, len(todo))
+            try:
+                digest_stamps[rel] = _document_stamp(root / rel)
+            except OSError:
+                pass
             if rel.lower().endswith(".pdf"):
                 text, _pages, reason = _pdf_text(rel, root / rel)
                 if not text:  # a scan, or a PDF PDFium could not open: `unconverted`, never indexed
@@ -614,18 +884,30 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
             skipped.pop(rel, None)
             changed += 1
             if time.monotonic() - last_flush > _FLUSH_S:
-                _flush(store, meta, failed)
+                _flush(store, meta, failed, digest_stamps)
                 last_flush = time.monotonic()
         if progress and todo:
             progress("index", len(todo), len(todo))
-        for gone in [p for p in list(stamps) + list(skipped) if p not in live]:
-            stamps.pop(gone, None)
-            skipped.pop(gone, None)
-            units.pop(gone, None)
-            _extract_cache(gone).unlink(missing_ok=True)  # a deleted PDF leaves no extraction behind
-        for gone in [p for p in store.paths() if _split_key(p)[0] not in live]:
-            store.remove(gone)
-        _flush(store, meta, failed)
+        if not guarded:
+            for gone in [p for p in list(stamps) + list(skipped) if p not in live]:
+                stamps.pop(gone, None)
+                skipped.pop(gone, None)
+                units.pop(gone, None)
+                cache = _extract_cache(gone)
+                cache.unlink(missing_ok=True)  # deleted PDFs leave no extraction behind
+                cache.with_suffix(".json").unlink(missing_ok=True)
+                cache.with_suffix(".stamp").unlink(missing_ok=True)
+            for gone in [p for p in store.paths() if _split_key(p)[0] not in live]:
+                store.remove(gone)
+            for rel in live:
+                try:
+                    digest_stamps[rel] = _document_stamp(root / rel)
+                except OSError:
+                    digest_stamps.pop(rel, None)
+            for gone in list(digest_stamps):
+                if gone not in live:
+                    digest_stamps.pop(gone, None)
+        _flush(store, meta, failed, digest_stamps)
         # Every live document is now stamped, skipped or failed, so the state is
         # known without another walk: only the failures are still pending.
         state = {"state": "stale" if failed else "ready", "docs": len(stamps),
@@ -719,6 +1001,8 @@ def silica_files(
     stamps = meta.get("stamps", {})
     skipped = meta.get("no_text", {})
     failed = _failures()
+    manifest = _manifest_inventory()
+    digest_meta = _load_digest_meta() if manifest is None else {}
     entries: list[dict] = []
     excluded_dirs = 0
     for rel, full in _walk(base):
@@ -738,10 +1022,20 @@ def silica_files(
         if cut is not None:
             row["modified"] = _iso(st.st_mtime)
         suffix = full.suffix.lower()
+        live_stamp = manifest[0].get(rel) if manifest is not None else None
+        if manifest is None:
+            identity_indexed = stamps.get(rel) == st.st_mtime
+            if identity_indexed and rel in digest_meta:
+                try:
+                    identity_indexed = digest_meta[rel] == _document_stamp(full)
+                except OSError:
+                    identity_indexed = False
+        else:
+            identity_indexed = live_stamp is not None and stamps.get(rel) == live_stamp
         if rel in failed:
             row.update(status="failed", reason=failed[rel])
         elif suffix in _PROSE_SUFFIXES:
-            row["status"] = "indexed" if stamps.get(rel) == st.st_mtime else "changed"
+            row["status"] = "indexed" if identity_indexed else "changed"
             src, state = _conversion_of(full, _head(full)) if suffix == ".md" else (None, None)
             if state:  # the note a conversion wrote carries the verdict too: it is the path search returns
                 row.update(source=src, source_state=state)
@@ -753,18 +1047,28 @@ def silica_files(
                            source_state=_source_state(full, _read(sidecar)))
             elif suffix != ".pdf":
                 row.update(status="unconverted", reason=_NO_SIDECAR)
-            elif stamps.get(rel) == st.st_mtime:
+            elif identity_indexed:
                 row["status"] = "indexed"
-            elif skip.get("mtime") == st.st_mtime:
-                # the index read this PDF and found no text to index; `reason` says why
+            elif manifest is not None and skip.get("mtime") == live_stamp:
                 row.update(status="unconverted", reason=skip.get("reason") or "no text layer")
+            elif manifest is None and skip.get("mtime") == st.st_mtime:
+                skip_indexed = True
+                if rel in digest_meta:
+                    try:
+                        skip_indexed = digest_meta[rel] == _document_stamp(full)
+                    except OSError:
+                        skip_indexed = False
+                if skip_indexed:
+                    row.update(status="unconverted", reason=skip.get("reason") or "no text layer")
+                else:
+                    row["status"] = "changed"
             else:
                 row["status"] = "changed"
         elif _is_code(rel):
             if st.st_size > _CODE_MAX_BYTES:
                 row.update(status="excluded", reason=f"not indexed: over {_CODE_MAX_BYTES // 1024} KB")
             else:
-                row["status"] = "indexed" if stamps.get(rel) == st.st_mtime else "changed"
+                row["status"] = "indexed" if identity_indexed else "changed"
         else:
             row.update(status="excluded", reason=f"not indexed: {suffix or 'no extension'}")
         entries.append(row)
@@ -805,12 +1109,13 @@ _section_cache: dict[tuple[str, float], tuple[str, list[tuple[int, str, Counter,
 def _sections_of(key: str) -> tuple[str, list[tuple[int, str, Counter, int, str]]]:
     """Text and (offset, section, term counts, length, title) per section — a
     heading section in a note, a page in a PDF, a symbol in a source file —
-    cached by mtime so a second query over the same top documents does not
-    retokenize (nor re-extract). For a unit key (`path#offset`) the one unit,
+    cached by content identity so a second query over the same top documents
+    does not retokenize (nor re-extract), and a same-size replacement cannot
+    reuse the old text. For a unit key (`path#offset`) the one unit,
     with the whole file's text, so a line is counted from the file's start."""
     rel, unit = _split_key(key)
     full = _root() / rel
-    stamp = (rel, full.stat().st_mtime)
+    stamp = (rel, _document_stamp(full))
     if stamp not in _section_cache:
         if full.suffix.lower() == ".pdf":
             text, pages, _reason = _pdf_text(rel, full)

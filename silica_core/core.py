@@ -373,29 +373,65 @@ def _notes() -> dict[str, float]:
     return _inventory()[0]
 
 
-def _manifest_inventory() -> tuple[dict[str, float], list[str]] | None:
-    """The inventory from `SILICA_INVENTORY`, a JSON file
-    `{"stamps": {rel: number}, "unextracted": [rel, ...]}`, or None when the
-    variable is unset, unreadable or malformed: where a corpus lives is worth
+def _manifest_numbers(value: Any) -> dict[str, float]:
+    """A `rel -> number` field of a manifest, or `{}` when it is absent or any
+    value is not a number: a malformed field is treated as the field not being
+    there, so a request that needs it (a listing's `sizes`) falls back to the
+    walk rather than trusting a bad one."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, float] = {}
+    for rel, n in value.items():
+        if isinstance(n, bool) or not isinstance(n, (int, float)):
+            return {}
+        out[str(rel)] = float(n)
+    return out
+
+
+def _manifest_inventory() -> dict | None:
+    """The `SILICA_INVENTORY` manifest, parsed and checked against the frozen
+    interface, or None when the variable is unset, unreadable or fails a rule
+    (`version` is `1`, `root` equals the configured root, `count` matches
+    `len(stamps)`, every stamp an int or float): where a corpus lives is worth
     an optimisation, never a failure, so anything the walk can still answer
-    falls back to the walk. The stamp is the number the index compares for
-    equality against the one it stored, so it may be an mtime or a digest of
-    the content — only the latter gives real change detection behind a mount
-    that reports a parent-directory mtime. A caller hashing content keeps the
-    value exact in a float by using the first 12 hex digits (48 bits, well
-    inside a double). The order of `stamps` is not significant: the rows are
-    sorted here, as `_inventory` sorts its own.
+    falls back to the walk. One parser for every consumer — the search path,
+    the listing tool, the state report.
+
+    The result carries `stamps` (`rel -> number`, sorted), `unextracted`,
+    `sizes`, `mtimes` (each `rel -> number` or `{}` when absent) and
+    `generated_at`. The stamp is the number the index compares for equality
+    against the one it stored, so it may be an mtime or a digest of the
+    content — only the latter gives real change detection behind a mount that
+    reports a parent-directory mtime. A caller hashing content keeps the value
+    exact in a float by using the first 12 hex digits (48 bits, well inside a
+    double). The order of `stamps` is not significant: the rows are sorted
+    here, as `_inventory` sorts its own.
     """
     raw = os.environ.get("SILICA_INVENTORY", "").strip()
     if not raw:
         return None
     try:
         data = orjson.loads(Path(raw).read_bytes())
-        stamps = {str(rel): float(mt) for rel, mt in data["stamps"].items()}
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    except (OSError, ValueError):
         return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    if str(data.get("root")) != str(_root()):
+        return None
+    raw_stamps = data.get("stamps")
+    if not isinstance(raw_stamps, dict) or data.get("count") != len(raw_stamps):
+        return None
+    stamps: dict[str, float] = {}
+    for rel, mt in raw_stamps.items():
+        if isinstance(mt, bool) or not isinstance(mt, (int, float)):
+            return None
+        stamps[str(rel)] = float(mt)
     unextracted = data.get("unextracted")
-    return dict(sorted(stamps.items())), [str(rel) for rel in unextracted] if isinstance(unextracted, list) else []
+    return {"stamps": dict(sorted(stamps.items())),
+            "unextracted": [str(rel) for rel in unextracted] if isinstance(unextracted, list) else [],
+            "sizes": _manifest_numbers(data.get("sizes")),
+            "mtimes": _manifest_numbers(data.get("mtimes")),
+            "generated_at": data.get("generated_at")}
 
 
 def _inventory(base: Path | None = None) -> tuple[dict[str, float], list[str]]:
@@ -412,7 +448,7 @@ def _inventory(base: Path | None = None) -> tuple[dict[str, float], list[str]]:
     if base is None:
         manifest = _manifest_inventory()
         if manifest is not None:
-            return manifest
+            return manifest["stamps"], manifest["unextracted"]
 
     out: dict[str, float] = {}
     unextracted: list[str] = []
@@ -498,14 +534,31 @@ def _mtime(rel: str) -> float | None:
         return None
 
 
+def _inventory_block(live: dict[str, float] | None = None) -> dict:
+    """Which inventory answered a pass, for `index_state`: the manifest that
+    stood in for the walk, with `generated_at` so a deployment can see how old
+    it is, or the walk. A stale or subset manifest is surfaced here, never
+    rejected — otherwise a frozen or partial index reports `ready` with nothing
+    saying why. `count` is the documents the answering source holds: the
+    manifest's own, or the walk's when the caller already walked (None for a
+    cold index that has not)."""
+    manifest = _manifest_inventory()
+    if manifest is not None:
+        return {"source": "manifest", "root": str(_root()),
+                "generated_at": manifest.get("generated_at"), "count": len(manifest["stamps"])}
+    return {"source": "walk", "root": str(_root()), "generated_at": None,
+            "count": None if live is None else len(live)}
+
+
 def index_state(meta: dict | None = None, live: dict[str, float] | None = None) -> dict:
-    """{state: cold|stale|ready, docs, built_at, pending}. `cold` = never
-    built. `pending` counts what the index has not caught up with: documents
-    changed or new since their stamp, and stamped documents gone from disk.
-    `live` is `_notes()` when the caller already walked."""
+    """{state: cold|stale|ready, docs, built_at, pending, inventory}. `cold` =
+    never built. `pending` counts what the index has not caught up with:
+    documents changed or new since their stamp, and stamped documents gone from
+    disk. `inventory` says which source answered — a manifest or the walk — and
+    how old it is. `live` is `_notes()` when the caller already walked."""
     meta = meta or _load_meta()
     if not _paths.index_file(INDEX).is_file() or not meta.get("built_at"):
-        return {"state": "cold", "docs": 0, "built_at": None}
+        return {"state": "cold", "docs": 0, "built_at": None, "inventory": _inventory_block()}
     live = _notes() if live is None else live
     stamps = meta.get("stamps", {})
     skipped = meta.get("no_text", {})
@@ -513,7 +566,8 @@ def index_state(meta: dict | None = None, live: dict[str, float] | None = None) 
                   if stamps.get(r) != mt and skipped.get(r, {}).get("mtime") != mt)
     pending += sum(1 for r in stamps if r not in live)
     return {"state": "stale" if pending else "ready", "docs": len(stamps),
-            "built_at": meta.get("built_at"), "pending": pending}
+            "built_at": meta.get("built_at"), "pending": pending,
+            "inventory": _inventory_block(live)}
 
 
 def _flush(store, meta: dict, failed: dict) -> None:
@@ -552,6 +606,21 @@ def build_index(rebuild: bool = False, embed: bool = False, live: dict[str, floa
         return _build_index(rebuild, embed, live, allow_remote, progress)
 
 
+def _max_drop() -> float:
+    """`SILICA_INVENTORY_MAX_DROP`: the fraction of stored rows a single
+    manifest pass may remove before it aborts, so a manifest that covers a
+    subset of the root cannot empty an index. A fraction in [0, 1], default
+    0.1; an unset or unparseable value is the default."""
+    raw = os.environ.get("SILICA_INVENTORY_MAX_DROP", "").strip()
+    if not raw:
+        return 0.1
+    try:
+        frac = float(raw)
+    except ValueError:
+        return 0.1
+    return frac if 0.0 <= frac <= 1.0 else 0.1
+
+
 def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, float] | None = None,
                  allow_remote: bool = False, progress: Callable[[str, int, int], None] | None = None) -> dict:
     """Build or refresh the document index. Incremental by mtime; `rebuild`
@@ -573,6 +642,21 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         units: dict[str, list[str]] = meta.setdefault("units", {})  # code file -> its unit keys
         root = _root()
         live = _notes() if live is None else live
+        # Prune guard: a manifest that covers only part of the root would drop
+        # every row it omits. Rows absent from the manifest are meant to go, but
+        # one manifest-driven pass that would remove more than
+        # SILICA_INVENTORY_MAX_DROP of the stored rows aborts before anything is
+        # written, so a subset manifest cannot empty an index.
+        if not rebuild and _manifest_inventory() is not None:
+            stored = len(stamps) + len(skipped)
+            drop = sum(1 for p in list(stamps) + list(skipped) if p not in live)
+            max_drop = _max_drop()
+            if stored and drop > max_drop * stored:
+                return _error("inventory_prune_refused",
+                              f"the manifest lists {len(live)} documents and would remove "
+                              f"{drop} of {stored} stored rows (over {max_drop:.0%}); the index is left untouched",
+                              docs=len(stamps), changed=0, removed=drop, stored=stored,
+                              index=index_state(meta, live=live))
         changed, failed = 0, {}
         last_flush = time.monotonic()
         todo = [(rel, mt) for rel, mt in live.items()
@@ -668,6 +752,136 @@ def _embed_units(rel: str) -> list[tuple[int, str]]:
 # 1. files
 # ---------------------------------------------------------------------------
 
+def _manifest_covers(manifest: dict, cut: float | None) -> bool:
+    """Whether a manifest can answer a listing: its `sizes` must cover every
+    stamp, and, for a `since=` listing, its `mtimes` must too — a row with no
+    date cannot be compared to the cut, and answering without one would drop
+    what changed."""
+    stamps = manifest["stamps"]
+    if not set(stamps) <= set(manifest["sizes"]):
+        return False
+    if cut is not None and not set(stamps) <= set(manifest["mtimes"]):
+        return False
+    return True
+
+
+def _walk_entries(base, cut: float | None, stamps: dict, skipped: dict, failed: dict,
+                  DOC_EXTS, IMG_EXTS) -> tuple[list[dict], int]:
+    """Today's listing: one walk of `base`, every file stat'd, and the reads a
+    row needs (a `.md` head, a sidecar, a source hash) run as it goes. Used
+    whenever no manifest covers the request."""
+    root = _root()
+    entries: list[dict] = []
+    excluded_dirs = 0
+    for rel, full in _walk(base):
+        if full is None:  # a directory not entered, or a file `.silicaignore` names
+            excluded_dirs += rel.endswith("/")
+            if cut is None:  # what the walk never entered has no date to compare
+                entries.append({"path": rel, "status": "excluded",
+                                "reason": "hidden" if rel.rstrip("/").rsplit("/", 1)[-1].startswith(".") else "ignore rule"})
+            continue
+        try:
+            st = full.stat()
+        except OSError:
+            continue
+        if cut is not None and st.st_mtime <= cut:
+            continue
+        row: dict = {"path": rel, "bytes": st.st_size}  # `status` says whether it changed; a float mtime said nothing more
+        if cut is not None:
+            row["modified"] = _iso(st.st_mtime)
+        suffix = full.suffix.lower()
+        if rel in failed:
+            row.update(status="failed", reason=failed[rel])
+        elif suffix in _PROSE_SUFFIXES:
+            row["status"] = "indexed" if stamps.get(rel) == st.st_mtime else "changed"
+            src, state = _conversion_of(full, _head(full)) if suffix == ".md" else (None, None)
+            if state:  # the note a conversion wrote carries the verdict too: it is the path search returns
+                row.update(source=src, source_state=state)
+        elif suffix in DOC_EXTS and suffix not in IMG_EXTS:
+            sidecar = full.with_suffix(".md")
+            skip = skipped.get(rel, {})
+            if sidecar.is_file():
+                row.update(status="excluded", reason=f"converted: {sidecar.relative_to(root).as_posix()}",
+                           source_state=_source_state(full, _read(sidecar)))
+            elif suffix != ".pdf":
+                row.update(status="unconverted", reason=_NO_SIDECAR)
+            elif stamps.get(rel) == st.st_mtime:
+                row["status"] = "indexed"
+            elif skip.get("mtime") == st.st_mtime:
+                # the index read this PDF and found no text to index; `reason` says why
+                row.update(status="unconverted", reason=skip.get("reason") or "no text layer")
+            else:
+                row["status"] = "changed"
+        elif _is_code(rel):
+            if st.st_size > _CODE_MAX_BYTES:
+                row.update(status="excluded", reason=f"not indexed: over {_CODE_MAX_BYTES // 1024} KB")
+            else:
+                row["status"] = "indexed" if stamps.get(rel) == st.st_mtime else "changed"
+        else:
+            row.update(status="excluded", reason=f"not indexed: {suffix or 'no extension'}")
+        entries.append(row)
+    return entries, excluded_dirs
+
+
+def _manifest_entries(manifest: dict, stamps: dict, skipped: dict, failed: dict,
+                      scope: str, cut: float | None) -> tuple[list[dict], int]:
+    """The listing rows a manifest implies: a stamp is `indexed` or `changed`
+    by comparing it to the index's stored one, an `unextracted` document is
+    `unconverted`, and `sizes` gives each row its bytes. A row the manifest does
+    not name — a type the index never reads, a hidden or ignored name — is
+    absent: the manifest does not carry it. No file is read here; the rows of
+    the returned page are finished by `_manifest_page_row`."""
+    sizes = manifest["sizes"]
+    mtimes = manifest["mtimes"]
+    entries: list[dict] = []
+    for rel, stamp in manifest["stamps"].items():
+        if scope and not _paths.in_folder(rel, scope):
+            continue
+        if cut is not None:
+            mt = mtimes.get(rel)
+            if mt is None or mt <= cut:
+                continue
+        row: dict = {"path": rel, "bytes": sizes.get(rel)}
+        if cut is not None:
+            row["modified"] = _iso(mtimes[rel])
+        if rel in failed:
+            row.update(status="failed", reason=failed[rel])
+        else:
+            skip = skipped.get(rel, {})
+            if skip.get("mtime") == stamp:  # a PDF whose text layer the index could not read
+                row.update(status="unconverted", reason=skip.get("reason") or "no text layer")
+            else:
+                row["status"] = "indexed" if stamps.get(rel) == stamp else "changed"
+        entries.append(row)
+    for rel in manifest["unextracted"]:
+        if scope and not _paths.in_folder(rel, scope):
+            continue
+        if cut is not None:
+            continue  # an unextracted document carries no date in the manifest
+        entries.append({"path": rel, "bytes": sizes.get(rel),
+                        "status": "unconverted", "reason": _NO_SIDECAR})
+    return entries, 0
+
+
+def _manifest_page_row(row: dict, root: Path) -> None:
+    """Finish one row of a manifest listing — the reads it needs, and only for a
+    row the page returns. `bytes` the manifest did not carry (an `unextracted`
+    document has no `sizes` entry) comes from one stat; a `.md` a conversion
+    wrote gets its `source` and `source_state` from its head and, when the
+    sidecar records one, its original's hash."""
+    rel = row["path"]
+    full = root / rel
+    if row.get("bytes") is None:
+        try:
+            row["bytes"] = full.stat().st_size
+        except OSError:
+            pass
+    if Path(rel).suffix.lower() == ".md" and row.get("status") != "failed":
+        src, state = _conversion_of(full, _head(full))
+        if state:
+            row.update(source=src, source_state=state)
+
+
 @tool(cls="atomic")
 def silica_files(
     folder: Annotated[str, Field(description="Root-relative folder to list; empty = the whole root")] = "",
@@ -719,55 +933,15 @@ def silica_files(
     stamps = meta.get("stamps", {})
     skipped = meta.get("no_text", {})
     failed = _failures()
-    entries: list[dict] = []
-    excluded_dirs = 0
-    for rel, full in _walk(base):
-        if full is None:  # a directory not entered, or a file `.silicaignore` names
-            excluded_dirs += rel.endswith("/")
-            if cut is None:  # what the walk never entered has no date to compare
-                entries.append({"path": rel, "status": "excluded",
-                                "reason": "hidden" if rel.rstrip("/").rsplit("/", 1)[-1].startswith(".") else "ignore rule"})
-            continue
-        try:
-            st = full.stat()
-        except OSError:
-            continue
-        if cut is not None and st.st_mtime <= cut:
-            continue
-        row: dict = {"path": rel, "bytes": st.st_size}  # `status` says whether it changed; a float mtime said nothing more
-        if cut is not None:
-            row["modified"] = _iso(st.st_mtime)
-        suffix = full.suffix.lower()
-        if rel in failed:
-            row.update(status="failed", reason=failed[rel])
-        elif suffix in _PROSE_SUFFIXES:
-            row["status"] = "indexed" if stamps.get(rel) == st.st_mtime else "changed"
-            src, state = _conversion_of(full, _head(full)) if suffix == ".md" else (None, None)
-            if state:  # the note a conversion wrote carries the verdict too: it is the path search returns
-                row.update(source=src, source_state=state)
-        elif suffix in DOC_EXTS and suffix not in IMG_EXTS:
-            sidecar = full.with_suffix(".md")
-            skip = skipped.get(rel, {})
-            if sidecar.is_file():
-                row.update(status="excluded", reason=f"converted: {sidecar.relative_to(root).as_posix()}",
-                           source_state=_source_state(full, _read(sidecar)))
-            elif suffix != ".pdf":
-                row.update(status="unconverted", reason=_NO_SIDECAR)
-            elif stamps.get(rel) == st.st_mtime:
-                row["status"] = "indexed"
-            elif skip.get("mtime") == st.st_mtime:
-                # the index read this PDF and found no text to index; `reason` says why
-                row.update(status="unconverted", reason=skip.get("reason") or "no text layer")
-            else:
-                row["status"] = "changed"
-        elif _is_code(rel):
-            if st.st_size > _CODE_MAX_BYTES:
-                row.update(status="excluded", reason=f"not indexed: over {_CODE_MAX_BYTES // 1024} KB")
-            else:
-                row["status"] = "indexed" if stamps.get(rel) == st.st_mtime else "changed"
-        else:
-            row.update(status="excluded", reason=f"not indexed: {suffix or 'no extension'}")
-        entries.append(row)
+    manifest = _manifest_inventory()
+    if manifest is not None and _manifest_covers(manifest, cut):
+        # A manifest names the documents; the rows come from it, and the reads a
+        # row needs — a `.md` head, a sidecar, a source hash — wait for the page.
+        serve_manifest = True
+        entries, excluded_dirs = _manifest_entries(manifest, stamps, skipped, failed, scope, cut)
+    else:
+        serve_manifest = False
+        entries, excluded_dirs = _walk_entries(base, cut, stamps, skipped, failed, DOC_EXTS, IMG_EXTS)
     counts = Counter(e["status"] for e in entries)
     # The folders the walk did not enter are a count in every listing and rows
     # only under status=excluded: thirteen hidden folders opened every listing
@@ -781,6 +955,9 @@ def silica_files(
     except ValueError:
         return _error("bad_argument", "cursor must be the next_cursor of a previous reply")
     page = entries[offset:offset + limit]
+    if serve_manifest:
+        for row in page:  # a manifest row's bytes and conversion verdict are read here, and only here
+            _manifest_page_row(row, root)
     truncated = offset + limit < len(entries)
     return {"root": str(root), "total": len(entries), "files": page,
             "counts": {k: counts.get(k, 0) for k in ("indexed", "changed", "excluded", "failed", "unconverted")},

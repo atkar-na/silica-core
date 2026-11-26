@@ -32,8 +32,8 @@ it yet; the refactor is done when it does and the acceptance checks pass.
 | `root` | absolute root every path in the reply is relative to |
 | `version` | short content hash of a file at read time. A caller that carries it forward detects change instead of citing different bytes under an old reference |
 | `truncated` | true when a cap cut the reply; the reply says how to fetch the rest |
-| `index` | `{state, docs, built_at, pending}` with `state` one of `cold` (never built), `ready`, `stale` (behind the disk by `pending` documents: changed, new or gone). An empty result under `cold` is not "no match"; a reply under `stale` was served from the index as it was |
-| `error` | only on failure: `{code, hint}` with `code` one of `not_found`, `out_of_root`, `changed`, `index_cold`, `unconverted`, `bad_argument`, `consent_required` |
+| `index` | `{state, docs, built_at, pending, inventory}` with `state` one of `cold` (never built), `ready`, `stale` (behind the disk by `pending` documents: changed, new or gone). An empty result under `cold` is not "no match"; a reply under `stale` was served from the index as it was. `inventory` is `{source, root, generated_at, count}`: which inventory answered — a `SILICA_INVENTORY` `manifest` or the `walk` — with the manifest's `generated_at` so a deployment sees how old the answer is |
+| `error` | only on failure: `{code, hint}` with `code` one of `not_found`, `out_of_root`, `changed`, `index_cold`, `unconverted`, `bad_argument`, `consent_required`, `inventory_prune_refused` (a manifest pass would remove more than `SILICA_INVENTORY_MAX_DROP` of the stored rows; the index is left untouched) |
 
 ## 1. `silica_files` — inventory and index state
 

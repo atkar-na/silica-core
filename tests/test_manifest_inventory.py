@@ -50,8 +50,11 @@ def root(tmp_path, monkeypatch):
 
 
 def _manifest(tmp_path, stamps, unextracted=()):
+    from silica_core.core import _root
+
     path = tmp_path / "inventory.json"
-    path.write_text(json.dumps({"stamps": stamps, "unextracted": list(unextracted)}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 1, "root": str(_root()), "count": len(stamps),
+                                "stamps": stamps, "unextracted": list(unextracted)}), encoding="utf-8")
     return path
 
 

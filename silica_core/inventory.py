@@ -36,23 +36,29 @@ import orjson
 __all__ = ["build_manifest", "write_manifest", "digest_stamp", "main"]
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
 def digest_stamp(digest: str) -> int:
     """A content digest → the stamp the index compares for equality.
 
     The first 12 hex digits as an int: 48 bits, exactly representable in a
     float, so the value survives JSON and the reader's `float()` unchanged.
-    Take more digits and the comparison silently loses them. A missing,
-    non-hex or too-short digest is a malformed row, not an incomplete one, so
-    it raises here regardless of `allow_incomplete`.
+    Take more digits and the comparison silently loses them. The digest must be
+    a clean 40-character hex string — a `sha1` hexdigest — and nothing else: a
+    bool, `None`, a non-string, a wrong length, or a character outside `[0-9a-f]`
+    is a malformed row, not an incomplete one, so it raises here rather than
+    having the extra characters silently dropped. `int(d[:12], 16)` alone would
+    accept `0123456789abXYZ` (non-hex past the cut) and `0x…`, so the characters
+    are checked before the truncation.
     """
     if not isinstance(digest, str):
         raise ValueError(f"a digest stamp must be a hex string, not {type(digest).__name__}")
-    if len(digest) < 12:
-        raise ValueError(f"a digest stamp needs at least 12 hex digits, got {digest!r}")
-    try:
-        return int(digest[:12], 16)
-    except ValueError as e:
-        raise ValueError(f"a digest stamp must be hex, got {digest!r}: {e}") from e
+    if len(digest) != 40:
+        raise ValueError(f"a digest stamp must be 40 hex characters, got {len(digest)}")
+    if any(c not in _HEX_DIGITS for c in digest):
+        raise ValueError(f"a digest stamp must be hex, got {digest!r}")
+    return int(digest[:12], 16)
 
 
 def _excluded(rel: str, skip) -> bool:

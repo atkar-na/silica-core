@@ -147,7 +147,7 @@ def test_digest_stamp_is_the_first_12_hex_digits_as_an_int():
     from silica_core.inventory import digest_stamp
 
     assert digest_stamp("a" * 40) == int("a" * 12, 16)
-    assert digest_stamp("0123456789abcdef0123") == int("0123456789ab", 16)
+    assert digest_stamp("0123456789ab" + "cd" * 14) == int("0123456789ab", 16)
     assert isinstance(digest_stamp("0" * 40), int)
     # 48 bits is exactly a float: the round-trip through JSON loses nothing.
     assert float(digest_stamp("f" * 40)) == int("f" * 12, 16)

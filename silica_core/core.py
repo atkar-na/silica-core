@@ -389,19 +389,46 @@ def _notes() -> dict[str, float]:
     return _inventory()[0]
 
 
-def _manifest_numbers(value: Any) -> dict[str, float]:
-    """A `rel -> number` field of a manifest, or `{}` when it is absent or any
-    value is not a number: a malformed field is treated as the field not being
-    there, so a request that needs it (a listing's `sizes`) falls back to the
-    walk rather than trusting a bad one."""
-    if not isinstance(value, dict):
-        return {}
-    out: dict[str, float] = {}
-    for rel, n in value.items():
-        if isinstance(n, bool) or not isinstance(n, (int, float)):
-            return {}
-        out[str(rel)] = float(n)
-    return out
+def _manifest_rel(key) -> str | None:
+    """A manifest key as a root-relative, normalised posix path, or None when it
+    is not one. A key is a path a consumer joins to the root, so it must not be
+    able to name anything outside it: an empty key, an absolute path, a
+    backslash, or any `.`/`..` or empty component is refused. Every manifest map
+    (`stamps`, `sizes`, `mtimes`, `unextracted`) is validated through this, so a
+    manifest can never point a read at a path outside the root."""
+    if not isinstance(key, str) or not key or key.startswith("/") or "\\" in key:
+        return None
+    if any(part in ("", ".", "..") for part in key.split("/")):
+        return None
+    return key
+
+
+def _manifest_number(value) -> float | None:
+    """A stamp, size or mtime as a float, or None when it is not a real number.
+    `bool` is an `int` in Python and the schema forbids it as a number, so it is
+    refused explicitly — the same reason `version`/`count` use `type(x) is int`."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+_manifest_reason_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "silica_manifest_reason", default=None)
+
+
+def _manifest_fail(reason: str):
+    """Record why a manifest was refused and yield None: the reader falls back
+    to the walk, and `index_state` can then say why the walk answered."""
+    _manifest_reason_var.set(reason)
+    return None
+
+
+def _manifest_reason() -> str | None:
+    """Why the last manifest parse refused the file, or None when no manifest is
+    configured or the one there was accepted. Read after `_manifest_inventory`,
+    which resolves the parse (once per public call) and records the reason; the
+    value lives in a ContextVar so one thread's refusal never leaks to another."""
+    return _manifest_reason_var.get()
 
 
 def _manifest_inventory() -> dict | None:
@@ -416,47 +443,101 @@ def _manifest_inventory() -> dict | None:
 
 def _manifest_inventory_uncached() -> dict | None:
     """The `SILICA_INVENTORY` manifest, parsed and checked against the frozen
-    interface, or None when the variable is unset, unreadable or fails a rule
-    (`version` is `1`, `root` equals the configured root, `count` matches
-    `len(stamps)`, every stamp an int or float): where a corpus lives is worth
-    an optimisation, never a failure, so anything the walk can still answer
-    falls back to the walk. One parser for every consumer — the search path,
-    the listing tool, the state report.
+    interface, or None when the variable is unset, unreadable or fails a rule —
+    and then the walk answers instead, because where a corpus lives is worth an
+    optimisation, never a failure. Every rule is strict, so a malformed manifest
+    cannot smuggle a value past a type check:
+
+    * `version` is exactly the integer `1` (`type(x) is int`, so `true`/`1.0` are
+      not `1`);
+    * `root` equals the configured root;
+    * `count` is a real int equal to `len(stamps)` — never a bool, and a
+      truncated write's short count is caught;
+    * every `stamps`/`sizes`/`mtimes`/`unextracted` key is a root-relative,
+      normalised path that cannot escape the root (no absolute path, no `.`/`..`
+      or empty component, so `../../outside.md` is refused);
+    * every `stamps`/`sizes`/`mtimes` value is a real number, never a bool.
 
     The result carries `stamps` (`rel -> number`, sorted), `unextracted`,
     `sizes`, `mtimes` (each `rel -> number` or `{}` when absent) and
     `generated_at`. The stamp is the number the index compares for equality
-    against the one it stored, so it may be an mtime or a digest of the
-    content — only the latter gives real change detection behind a mount that
-    reports a parent-directory mtime. A caller hashing content keeps the value
-    exact in a float by using the first 12 hex digits (48 bits, well inside a
-    double). The order of `stamps` is not significant: the rows are sorted
-    here, as `_inventory` sorts its own.
+    against the one it stored, so it may be an mtime or a digest of the content —
+    only the latter gives real change detection behind a mount that reports a
+    parent-directory mtime. A caller hashing content keeps the value exact in a
+    float by using the first 12 hex digits (48 bits, well inside a double). The
+    order of `stamps` is not significant: the rows are sorted here, as
+    `_inventory` sorts its own.
     """
     raw = os.environ.get("SILICA_INVENTORY", "").strip()
     if not raw:
+        _manifest_reason_var.set(None)
         return None
     try:
-        data = orjson.loads(Path(raw).read_bytes())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or data.get("version") != 1:
-        return None
+        blob = Path(raw).read_bytes()
+    except OSError as e:
+        return _manifest_fail(f"unreadable: {type(e).__name__}")
+    try:
+        data = orjson.loads(blob)
+    except ValueError as e:
+        return _manifest_fail(f"not JSON: {type(e).__name__}")
+    if not isinstance(data, dict):
+        return _manifest_fail("not a JSON object")
+
+    version = data.get("version")
+    if type(version) is not int or version != 1:
+        return _manifest_fail(f"version {version!r} is not the supported integer 1")
     if str(data.get("root")) != str(_root()):
-        return None
+        return _manifest_fail("root does not match the configured root")
+
     raw_stamps = data.get("stamps")
-    if not isinstance(raw_stamps, dict) or data.get("count") != len(raw_stamps):
-        return None
+    if not isinstance(raw_stamps, dict):
+        return _manifest_fail("stamps is missing or not an object")
+    count = data.get("count")
+    if type(count) is not int or count != len(raw_stamps):
+        return _manifest_fail(
+            f"count {count!r} is not an int equal to the {len(raw_stamps)} stamps")
+
     stamps: dict[str, float] = {}
     for rel, mt in raw_stamps.items():
-        if isinstance(mt, bool) or not isinstance(mt, (int, float)):
-            return None
-        stamps[str(rel)] = float(mt)
-    unextracted = data.get("unextracted")
+        if _manifest_rel(rel) is None:
+            return _manifest_fail(f"stamps key {rel!r} is not a root-relative path")
+        n = _manifest_number(mt)
+        if n is None:
+            return _manifest_fail(f"stamp for {rel!r} is not a real number")
+        stamps[rel] = n
+
+    numbers: dict[str, dict[str, float]] = {}
+    for field in ("sizes", "mtimes"):
+        if field not in data:
+            numbers[field] = {}
+            continue
+        block = data[field]
+        if not isinstance(block, dict):
+            return _manifest_fail(f"{field} is not an object")
+        out: dict[str, float] = {}
+        for rel, v in block.items():
+            if _manifest_rel(rel) is None:
+                return _manifest_fail(f"{field} key {rel!r} is not a root-relative path")
+            n = _manifest_number(v)
+            if n is None:
+                return _manifest_fail(f"{field} value for {rel!r} is not a real number")
+            out[rel] = n
+        numbers[field] = out
+
+    raw_unextracted = data.get("unextracted")
+    if raw_unextracted is not None and not isinstance(raw_unextracted, list):
+        return _manifest_fail("unextracted is not an array")
+    unextracted: list[str] = []
+    for rel in raw_unextracted or ():
+        if _manifest_rel(rel) is None:
+            return _manifest_fail(f"unextracted entry {rel!r} is not a root-relative path")
+        unextracted.append(rel)
+
+    _manifest_reason_var.set(None)
     return {"stamps": dict(sorted(stamps.items())),
-            "unextracted": [str(rel) for rel in unextracted] if isinstance(unextracted, list) else [],
-            "sizes": _manifest_numbers(data.get("sizes")),
-            "mtimes": _manifest_numbers(data.get("mtimes")),
+            "unextracted": unextracted,
+            "sizes": numbers["sizes"],
+            "mtimes": numbers["mtimes"],
             "generated_at": data.get("generated_at")}
 
 
@@ -626,8 +707,14 @@ def _inventory_block(live: dict[str, float] | None = None) -> dict:
     if manifest is not None:
         return {"source": "manifest", "root": str(_root()),
                 "generated_at": manifest.get("generated_at"), "count": len(manifest["stamps"])}
-    return {"source": "walk", "root": str(_root()), "generated_at": None,
-            "count": None if live is None else len(live)}
+    block = {"source": "walk", "root": str(_root()), "generated_at": None,
+             "count": None if live is None else len(live)}
+    reason = _manifest_reason()
+    if reason is not None:
+        # `SILICA_INVENTORY` was set but the manifest was refused: say why, so a
+        # malformed or unsafe manifest is visible instead of silently walking.
+        block["reason"] = reason
+    return block
 
 
 def index_state(meta: dict | None = None, live: dict[str, float] | None = None) -> dict:

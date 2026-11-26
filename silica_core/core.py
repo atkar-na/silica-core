@@ -6,6 +6,7 @@ code_pack, write_note. The CLI and the MCP server wrap these. Nothing here
 calls a model; the root is the folder Silica was started in (or --vault)."""
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import functools
 import hashlib
@@ -333,6 +334,51 @@ def _doc_text(rel: str) -> str:
     """What the index reads for one document: a note's bytes, a PDF's text layer."""
     full = _root() / rel
     return _pdf_text(rel, full)[0] if full.suffix.lower() == ".pdf" else _read(full)
+
+
+def _stamp_copy(path: Path, stamp: float) -> None:
+    """Give a fetched copy the modification time the inventory reported.
+
+    The extraction caches key a document on its identity stamp, which without
+    a manifest is the file's own mtime; a fresh temp file carries the wall
+    clock, so without this every fetched document would miss its cache on
+    every pass. A manifest stamp can be a digest rather than a time, in which
+    case the caches key on the digest and there is nothing to copy.
+    """
+    try:
+        if 0 <= float(stamp) < 1e11:
+            os.utime(path, (stamp, stamp))
+    except (OSError, TypeError, ValueError, OverflowError):
+        pass
+
+
+def _source_documents(todo: list[tuple[str, float]], root: Path):
+    """`(rel, stamp, path)` per document, in `todo` order.
+
+    With `SILICA_SOURCE_URL` unset this is the file itself under the root, and
+    the pass behaves exactly as it always has. With it set the bytes arrive
+    over HTTP, a bounded number of streams ahead of this loop, as local files,
+    so the extraction below never waits on the network; the order is the
+    pass's, not the network's, so the same documents produce the same store
+    whichever download finishes first.
+    """
+    from silica_core.source import SourceConfig, prefetch
+
+    config = SourceConfig.from_env()
+    if config is None:
+        for rel, mt in todo:
+            yield rel, mt, root / rel
+        return
+    stamps = dict(todo)
+    with prefetch(config, workdir=_paths.index_dir() / "tmp") as ahead:
+        for rel, copy, error in ahead.materialize([rel for rel, _mt in todo]):
+            if copy is None:
+                # One document the source would not serve is a failure the
+                # index records, exactly as an unreadable file is on disk.
+                yield rel, stamps[rel], error
+                continue
+            _stamp_copy(copy, stamps[rel])
+            yield rel, stamps[rel], copy
 
 
 def _is_text(full: Path) -> bool:
@@ -969,45 +1015,53 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         last_flush = time.monotonic()
         todo = [(rel, mt) for rel, mt in live.items()
                 if rebuild or not (stamps.get(rel) == mt or skipped.get(rel, {}).get("mtime") == mt)]
-        for done, (rel, mt) in enumerate(todo, 1):
-            if progress:
-                progress("index", done - 1, len(todo))
-            if rel.lower().endswith(".pdf"):
-                text, _pages, reason = _pdf_text(rel, root / rel)
-                if not text:  # a scan, or a PDF PDFium could not open: `unconverted`, never indexed
-                    skipped[rel] = {"mtime": mt, "reason": reason}
-                    if stamps.pop(rel, None) is not None:
-                        store.remove(rel)
+        # The bytes: the file under the root, or a copy fetched ahead of this
+        # loop when SILICA_SOURCE_URL is set. `closing` is what removes that
+        # copy when the loop leaves by exception or Ctrl+C, not only when it
+        # finishes; extraction itself is the same code for either source.
+        with contextlib.closing(_source_documents(todo, root)) as documents:
+            for done, (rel, mt, full) in enumerate(documents, 1):
+                if progress:
+                    progress("index", done - 1, len(todo))
+                if isinstance(full, Exception):  # the source would not serve it
+                    failed[rel] = str(full)
                     continue
-            elif _is_code(rel):
-                try:
-                    parts = _sections_of(rel)[1]
-                except OSError as e:
-                    failed[rel] = str(e)
+                if rel.lower().endswith(".pdf"):
+                    text, _pages, reason = _pdf_text(rel, full)
+                    if not text:  # a scan, or a PDF PDFium could not open: `unconverted`, never indexed
+                        skipped[rel] = {"mtime": mt, "reason": reason}
+                        if stamps.pop(rel, None) is not None:
+                            store.remove(rel)
+                        continue
+                elif _is_code(rel):
+                    try:
+                        parts = _sections_of(rel, full)[1]
+                    except OSError as e:
+                        failed[rel] = str(e)
+                        continue
+                    keys = [f"{rel}#{off}" for off, *_rest in parts]
+                    for old in units.get(rel, []):
+                        if old not in keys:
+                            store.remove(old)
+                    for (off, part, _tf, _dl, title), key in zip(parts, keys):
+                        store.upsert(key, title, part)
+                    units[rel] = keys
+                    stamps[rel] = mt
+                    changed += 1
                     continue
-                keys = [f"{rel}#{off}" for off, *_rest in parts]
-                for old in units.get(rel, []):
-                    if old not in keys:
-                        store.remove(old)
-                for (off, part, _tf, _dl, title), key in zip(parts, keys):
-                    store.upsert(key, title, part)
-                units[rel] = keys
+                else:
+                    try:
+                        text = _read(full)
+                    except OSError as e:
+                        failed[rel] = str(e)
+                        continue
+                store.upsert(rel, Path(rel).stem, text)
                 stamps[rel] = mt
+                skipped.pop(rel, None)
                 changed += 1
-                continue
-            else:
-                try:
-                    text = _read(root / rel)
-                except OSError as e:
-                    failed[rel] = str(e)
-                    continue
-            store.upsert(rel, Path(rel).stem, text)
-            stamps[rel] = mt
-            skipped.pop(rel, None)
-            changed += 1
-            if time.monotonic() - last_flush > _FLUSH_S:
-                _flush(store, meta, failed)
-                last_flush = time.monotonic()
+                if time.monotonic() - last_flush > _FLUSH_S:
+                    _flush(store, meta, failed)
+                    last_flush = time.monotonic()
         if progress and todo:
             progress("index", len(todo), len(todo))
         for gone in [p for p in list(stamps) + list(skipped) if p not in live]:
@@ -1311,15 +1365,20 @@ def _iso(ts: float) -> str:
 _section_cache: dict[tuple[str, float | int], tuple[str, list[tuple[int, str, Counter, int, str]]]] = {}
 
 
-def _sections_of(key: str) -> tuple[str, list[tuple[int, str, Counter, int, str]]]:
+def _sections_of(key: str, full: Path | None = None) -> tuple[str, list[tuple[int, str, Counter, int, str]]]:
     """Text and (offset, section, term counts, length, title) per section — a
     heading section in a note, a page in a PDF, a symbol in a source file —
     cached by identity stamp so a second query over the same top documents does
     not retokenize (nor re-extract), and a document replaced in place is not
     served from the cache. For a unit key (`path#offset`) the one unit,
-    with the whole file's text, so a line is counted from the file's start."""
+    with the whole file's text, so a line is counted from the file's start.
+
+    `full` is the path to read; the root-relative one by default. The index
+    pass passes a fetched copy when the bytes came over HTTP, so extraction
+    has one entry point either way.
+    """
     rel, unit = _split_key(key)
-    full = _root() / rel
+    full = full if full is not None else _root() / rel
     stamp = (rel, _identity_stamp(rel, full))
     if stamp not in _section_cache:
         if full.suffix.lower() == ".pdf":

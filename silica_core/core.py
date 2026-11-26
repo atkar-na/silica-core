@@ -834,7 +834,8 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         # Every live document is now stamped, skipped or failed, so the state is
         # known without another walk: only the failures are still pending.
         state = {"state": "stale" if failed else "ready", "docs": len(stamps),
-                 "built_at": meta["built_at"], "pending": len(failed)}
+                 "built_at": meta["built_at"], "pending": len(failed),
+                 "inventory": _inventory_block(live)}
         out = {"docs": len(stamps), "changed": changed, "failed": failed, "index": state}
     if embed:
         from silica_core import embeddings
@@ -873,16 +874,38 @@ def _embed_units(rel: str) -> list[tuple[int, str]]:
 # 1. files
 # ---------------------------------------------------------------------------
 
-def _manifest_covers(manifest: dict, cut: float | None) -> bool:
-    """Whether a manifest can answer a listing: its `sizes` must cover every
-    stamp, and, for a `since=` listing, its `mtimes` must too — a row with no
-    date cannot be compared to the cut, and answering without one would drop
-    what changed."""
+def _manifest_covers(manifest: dict, cut: float | None,
+                     known: dict[str, float] | None = None,
+                     skipped: dict[str, dict] | None = None) -> bool:
+    """Whether a manifest can answer a listing rather than the walk.
+
+    Coverage of the fields: `sizes` must name every stamp, and, for a `since=`
+    listing, `mtimes` must too — a row with no date cannot be compared to the
+    cut, and answering without one would drop what changed.
+
+    Coverage of the corpus: the manifest must describe the whole root, and a
+    file cannot prove that about itself. So the claim is earned against the rows
+    the index already holds (`known`, the stored stamps, and `skipped`, the
+    documents it read and held no text for): the manifest's own documents must
+    account for the stored rows up to the same ceiling the prune guard allows
+    (`SILICA_INVENTORY_MAX_DROP`). A manifest that omits more of the stored rows
+    than that is a subset of the corpus, not the corpus, and the walk answers
+    instead — a one-row manifest that listed a single document while the rest
+    vanished with no error is exactly that case. The ceiling is not zero so a
+    manifest written just after the corpus genuinely shrank is still served; an
+    operator whose corpus shrank past it says so with the same variable the
+    prune guard reads. With no stored rows there is nothing to disagree with, so
+    the field check alone decides."""
     stamps = manifest["stamps"]
     if not set(stamps) <= set(manifest["sizes"]):
         return False
     if cut is not None and not set(stamps) <= set(manifest["mtimes"]):
         return False
+    if known:
+        stored = list(known) + list(skipped or {})
+        omitted = sum(1 for rel in stored if rel not in stamps)
+        if stored and omitted > _max_drop() * len(stored):
+            return False
     return True
 
 
@@ -1056,7 +1079,7 @@ def silica_files(
     skipped = meta.get("no_text", {})
     failed = _failures()
     manifest = _manifest_inventory()
-    if manifest is not None and _manifest_covers(manifest, cut):
+    if manifest is not None and _manifest_covers(manifest, cut, stamps, skipped):
         # A manifest names the documents; the rows come from it, and the reads a
         # row needs — a `.md` head, a sidecar, a source hash — wait for the page.
         serve_manifest = True

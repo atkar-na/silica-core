@@ -460,7 +460,7 @@ def _identity_stamp(rel: str, full: Path) -> float | int:
     value is the one the caches already used, so behaviour is unchanged."""
     manifest = _manifest_inventory()
     if manifest is not None:
-        stamp = manifest[0].get(rel)
+        stamp = manifest["stamps"].get(rel)
         if stamp is not None:
             return stamp
     return full.stat().st_mtime_ns

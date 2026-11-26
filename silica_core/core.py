@@ -653,6 +653,46 @@ def _max_drop() -> float:
     return frac if 0.0 <= frac <= 1.0 else 0.1
 
 
+def _guard_live(live: dict[str, float], unextracted: list[str], meta: dict):
+    """The walk is the truth; a manifest is trusted only where it agrees with it.
+
+    A manifest that omits rows the walk can see is not a smaller corpus, it is a
+    broken or partial read of one, and a pass that removed its absent rows would
+    silently shrink the index (the empty-inventory defect). So on a
+    manifest-driven pass the walk is taken once more as the authority whenever
+    the two disagree, and the build then follows the walk.
+
+    When the walk cannot run at all — a manifest-only deployment, a share that
+    is down — the manifest is honoured only while it removes at most
+    `SILICA_INVENTORY_MAX_DROP` of the stored rows; past that the pass returns an
+    `inventory_prune_refused` error without writing, so the store is left
+    byte-identical and the caller sees the counts. The error carries `index`, so
+    a search that triggered this build serves the store it already has and
+    reports it stale rather than failing.
+    """
+    stamps: dict[str, float] = meta.get("stamps", {})
+    skipped: dict[str, dict] = meta.get("no_text", {})
+    walk_unextracted: list[str] = []
+    try:
+        walk_live, walk_unextracted = _inventory(base=_root())
+    except Exception:
+        walk_live = None
+    if walk_live is not None:
+        if set(live) == set(walk_live) and set(unextracted) == set(walk_unextracted):
+            return live, unextracted
+        return walk_live, walk_unextracted
+    stored = len(stamps) + len(skipped)
+    drop = sum(1 for p in list(stamps) + list(skipped) if p not in live)
+    max_drop = _max_drop()
+    if stored and drop > max_drop * stored:
+        return _error("inventory_prune_refused",
+                      f"the walk is unavailable and the manifest would remove "
+                      f"{drop} of {stored} stored rows (over {max_drop:.0%}); the index is left untouched",
+                      docs=len(stamps), changed=0, removed=drop, stored=stored,
+                      index=index_state(meta, live=live))
+    return live, unextracted
+
+
 def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, float] | None = None,
                  allow_remote: bool = False, progress: Callable[[str, int, int], None] | None = None) -> dict:
     """Build or refresh the document index. Incremental by mtime; `rebuild`
@@ -673,22 +713,23 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         skipped: dict[str, dict] = meta.setdefault("no_text", {})
         units: dict[str, list[str]] = meta.setdefault("units", {})  # code file -> its unit keys
         root = _root()
-        live = _notes() if live is None else live
-        # Prune guard: a manifest that covers only part of the root would drop
-        # every row it omits. Rows absent from the manifest are meant to go, but
-        # one manifest-driven pass that would remove more than
-        # SILICA_INVENTORY_MAX_DROP of the stored rows aborts before anything is
-        # written, so a subset manifest cannot empty an index.
-        if not rebuild and _manifest_inventory() is not None:
-            stored = len(stamps) + len(skipped)
-            drop = sum(1 for p in list(stamps) + list(skipped) if p not in live)
-            max_drop = _max_drop()
-            if stored and drop > max_drop * stored:
-                return _error("inventory_prune_refused",
-                              f"the manifest lists {len(live)} documents and would remove "
-                              f"{drop} of {stored} stored rows (over {max_drop:.0%}); the index is left untouched",
-                              docs=len(stamps), changed=0, removed=drop, stored=stored,
-                              index=index_state(meta, live=live))
+        manifest = _manifest_inventory()
+        if live is None:
+            # `_inventory()` answers from the manifest when one is set, and
+            # walks otherwise: a manifest-driven pass does not traverse.
+            live, unextracted = _inventory()
+        else:
+            unextracted = manifest["unextracted"] if manifest is not None else []
+        # Prune guard: the walk is the authority. A manifest that disagrees with
+        # it — a subset, a truncated write, a stale file — is replaced by the
+        # walk's own set rather than pruning the rows it omits; when the walk
+        # cannot run, one pass may remove at most `SILICA_INVENTORY_MAX_DROP` of
+        # the stored rows and otherwise aborts before anything is written.
+        if not rebuild and manifest is not None:
+            guarded = _guard_live(live, unextracted, meta)
+            if isinstance(guarded, dict):
+                return guarded
+            live, unextracted = guarded
         changed, failed = 0, {}
         last_flush = time.monotonic()
         todo = [(rel, mt) for rel, mt in live.items()

@@ -147,13 +147,33 @@ def test_a_manifest_for_another_root_or_a_short_count_falls_back_to_the_walk(roo
 # b. the prune guard
 # ---------------------------------------------------------------------------
 
-def test_prune_guard_refuses_a_pass_that_would_empty_the_index(root, tmp_path, monkeypatch):
+def test_a_subset_manifest_cannot_prune_the_index(root, tmp_path, monkeypatch):
+    """A manifest that omits rows the walk can see is not a smaller corpus, it is
+    a partial read of one: the walk is the authority and the rows stay."""
     root.build_index()
     assert root.index_state()["docs"] == 3
     stamps = root._load_meta()["stamps"]
     subset = {"version": 1, "root": str(root._root()), "count": 1,
               "stamps": {"docs/btree.md": stamps["docs/btree.md"]}}  # 1 of 3 stored rows
     monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, subset)))
+
+    out = root.build_index()
+
+    assert "error" not in out, "the walk answers, so the pass proceeds rather than refusing"
+    assert set(root._load_meta()["stamps"]) == {"docs/btree.md", "docs/ctree.md", "docs/lsm.md"}, \
+        "nothing was pruned"
+    assert root.index_state()["docs"] == 3
+
+
+def test_a_subset_manifest_prunes_nothing_when_the_walk_is_unavailable(root, tmp_path, monkeypatch):
+    """With no walk to appeal to, the manifest is the only claim there is: past
+    the threshold the pass aborts before writing, so the store is untouched."""
+    root.build_index()
+    stamps = root._load_meta()["stamps"]
+    subset = {"version": 1, "root": str(root._root()), "count": 1,
+              "stamps": {"docs/btree.md": stamps["docs/btree.md"]}}
+    monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, subset)))
+    monkeypatch.setattr(root, "_walk", _boom)
     before = _index_bytes(root)
 
     out = root.build_index()
@@ -172,26 +192,36 @@ def test_a_manifest_that_drops_nothing_proceeds_normally(root, tmp_path, monkeyp
     assert root.index_state()["docs"] == 3
 
 
-def test_the_prune_threshold_is_honoured(root, tmp_path, monkeypatch):
+def test_a_smaller_manifest_is_honoured_when_the_operator_raises_the_threshold(root, tmp_path, monkeypatch):
+    """An operator who knows the corpus shrank while the share is down says so
+    explicitly; the default would rather abort than guess."""
     root.build_index()
     stamps = root._load_meta()["stamps"]
     subset = {"version": 1, "root": str(root._root()), "count": 1,
               "stamps": {"docs/btree.md": stamps["docs/btree.md"]}}
+    monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, subset)))
+    monkeypatch.setattr(root, "_walk", _boom)
 
     # 2 of 3 = 0.67: over the default 0.1, but not over 0.7
-    monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, subset)))
     monkeypatch.setenv("SILICA_INVENTORY_MAX_DROP", "0.7")
     assert "error" not in root.build_index()
     assert root.index_state()["docs"] == 1
 
-    # back to the full corpus, then refuse at 0.5
-    monkeypatch.delenv("SILICA_INVENTORY", raising=False)
-    monkeypatch.delenv("SILICA_INVENTORY_MAX_DROP", raising=False)
-    root.build_index(rebuild=True)
-    assert root.index_state()["docs"] == 3
-    monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, subset, name="subset2.json")))
-    monkeypatch.setenv("SILICA_INVENTORY_MAX_DROP", "0.5")
-    assert root.build_index()["error"]["code"] == "inventory_prune_refused"
+
+def test_the_default_threshold_refuses_a_manifest_that_would_prune(root, tmp_path, monkeypatch):
+    """The same pass at the default 0.1 aborts, and the store is left alone."""
+    root.build_index()
+    stamps = root._load_meta()["stamps"]
+    subset = {"version": 1, "root": str(root._root()), "count": 1,
+              "stamps": {"docs/btree.md": stamps["docs/btree.md"]}}
+    monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, subset)))
+    monkeypatch.setattr(root, "_walk", _boom)
+    before = _index_bytes(root)
+
+    out = root.build_index()
+
+    assert out["error"]["code"] == "inventory_prune_refused"
+    assert _index_bytes(root) == before, "the store is left byte-identical"
     assert root.index_state()["docs"] == 3
 
 

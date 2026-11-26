@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 import re
+import sys
 import threading
 import time
 from collections import Counter
@@ -58,10 +59,6 @@ _STORE_RW = threading.RLock()
 # scope, where a partial walk has no consumer to tell.
 _walk_failures: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
     "silica_walk_failures", default=None)
-# Seconds between partial saves during a build, so Ctrl+C at 90% of a cold
-# build keeps the 90% and the next run does the rest (save() is hundreds of
-# ms on a big index, so not per document).
-_FLUSH_S = 5.0
 _NO_EMBEDDER = ("needs SILICA_EMBEDDING_BASE_URL (an OpenAI-compatible /v1/embeddings endpoint) "
                 "or SILICA_EMBEDDING_MODEL=model2vec/<id> with the [dense] extra")
 # The index this engine owns. The one line silica-internal changes when it
@@ -243,11 +240,18 @@ def _extract_cache(rel: str) -> Path:
     return _paths.index_dir() / "extract" / f"{hashlib.sha1(rel.encode()).hexdigest()}.txt"
 
 
-def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
-    """A PDF's own text layer, the page map, and the reason the layer is empty
-    when it is. Cached beside the index (`.txt` with the text, `.json` with the
-    map) and re-extracted whenever the source's identity stamp moves — the
-    manifest's stamp when `SILICA_INVENTORY` supplies one, else the PDF's mtime.
+def _pdf_text(rel: str, full: Path, max_pages: int = 0) -> tuple[str, list[dict], str, int]:
+    """A PDF's own text layer, the page map, the reason the layer is empty when
+    it is, and the document's total page count. Cached beside the index (`.txt`
+    with the text, `.json` with the map) and re-extracted whenever the source's
+    identity stamp moves — the manifest's stamp when `SILICA_INVENTORY`
+    supplies one, else the PDF's mtime.
+
+    `max_pages` (0 = no bound) stops the read after that many pages, so the
+    oversize guard can sample a huge drawing set instead of reading all of it.
+    A truncated read is never written to the cache: that cache is what `read`
+    and `page_map` serve, and a partial page map recorded as if it were the
+    whole document would hide the pages it never read.
 
     The page is the section: search ranks pages, `silica_read` serves one by
     `p. N`, `page_map` carries a slice back to its pages. The map is kept
@@ -282,7 +286,7 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
             # the pages, so a replaced file misses however constant its mtime is.
             if payload.get("stamp") == stamp:
                 text = cache.read_text(encoding="utf-8", errors="replace")
-                return text, payload["pages"], "" if text else "no text layer"
+                return text, payload["pages"], "" if text else "no text layer", len(payload["pages"])
         elif isinstance(payload, list) and not legacy_held_to_stamp \
                 and cache.stat().st_mtime >= full.stat().st_mtime:
             # A cache written before the field existed (a bare page array):
@@ -290,18 +294,20 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
             # when no manifest stamp exists to hold it to. A stamp the bare
             # list cannot record makes it a miss rather than a stale read.
             text = cache.read_text(encoding="utf-8", errors="replace")
-            return text, payload, "" if text else "no text layer"
+            return text, payload, "" if text else "no text layer", len(payload)
     except (OSError, ValueError):
         pass
     try:
         import pypdfium2 as pdfium
     except ImportError:  # pragma: no cover - a base dependency
-        return "", [], "pypdfium2 not installed"
+        return "", [], "pypdfium2 not installed", 0
     try:
         pdf = pdfium.PdfDocument(str(full))
         try:
+            total = len(pdf)
+            take = min(total, max_pages) if max_pages else total
             bodies = []
-            for i in range(len(pdf)):
+            for i in range(take):
                 page = pdf[i]
                 textpage = page.get_textpage()
                 try:
@@ -312,7 +318,7 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
         finally:
             pdf.close()
     except Exception as e:  # encrypted, truncated, not a PDF: a status, not a crash
-        return "", [], f"unreadable: {e}"
+        return "", [], f"unreadable: {e}", 0
     parts: list[str] = []
     pages: list[dict] = []
     line, offset = 1, 0
@@ -323,10 +329,13 @@ def _pdf_text(rel: str, full: Path) -> tuple[str, list[dict], str]:
         line += chunk.count("\n")
         offset += len(chunk)
     text = "".join(parts) if any(bodies) else ""
+    if max_pages and total > max_pages:
+        # A sampled read: the page map is partial, so it is not cached.
+        return text, (pages if text else []), "" if text else "no text layer", total
     cache.parent.mkdir(parents=True, exist_ok=True)
     _paths.atomic_write_bytes(cache, text.encode("utf-8"))
     _paths.atomic_write_bytes(pages_file, orjson.dumps({"stamp": stamp, "pages": pages if text else []}))
-    return text, (pages if text else []), "" if text else "no text layer"
+    return text, (pages if text else []), "" if text else "no text layer", total
 
 
 def _doc_text(rel: str) -> str:
@@ -807,10 +816,13 @@ def _flush(store, meta: dict, failed: dict) -> None:
     """Everything the build knows so far, on disk: the store, the stamps with
     a `built_at` so the next run is incremental, the failures.
 
-    The store is written only when it holds something the file does not:
-    `save()` serialises every row, so a rewrite that changes nothing is pure
-    I/O — hundreds of megabytes per call on a large index."""
-    if store.is_dirty():
+    Called once per `SILICA_INDEX_BATCH` generation, never on a timer, and the
+    store is written only when it holds something the file does not: `save()`
+    serialises every row, so a rewrite that changes nothing is pure I/O —
+    hundreds of megabytes per call on a large index."""
+    if store.is_dirty() or not store.on_disk():
+        # Never-written is not the same as nothing-to-write: an empty corpus
+        # still needs its index file, or `index_state` reads it as cold.
         store.save()
     meta["built_at"] = time.time()
     _paths.atomic_write_bytes(_meta_path(), orjson.dumps(meta))
@@ -966,13 +978,6 @@ def _index_processes() -> int:
     return n if n >= 1 else 1
 
 
-# Reason a document is reported failed when its worker process did not deliver
-# it (killed mid-pass, or the pool broke): the document keeps its old stamp or
-# none, so the next pass re-runs exactly it.
-_WORKER_DIED = "worker process died before this document was indexed"
-_WORKER_STALLED = "worker stalled past SILICA_INDEX_TIMEOUT and was abandoned"
-
-
 def _doc_result(rel: str, root: Path) -> tuple:
     """The read, extract and tokenize half of the first pass for one document,
     with no store mutation: a tagged tuple the caller applies.
@@ -981,16 +986,33 @@ def _doc_result(rel: str, root: Path) -> tuple:
     the same tuple the parent would, and the parent — the single writer — can
     apply results in `todo` order whatever order the workers finish in.
 
-    Tags: `("prose", rel, name, tf, length)` a note or a PDF with a text layer;
-    `("units", rel, [(key, title, tf, length), ...])` a code file's symbols;
-    `("skip", rel, reason)` a PDF with no text layer; `("fail", rel, message)`
-    a document that could not be read."""
+    Tags: `("prose", rel, name, tf, length[, truncated])` a note or a PDF with a
+    text layer — `truncated` is present on a PDF the oversize guard sampled, a
+    dict of `bytes`/`pages_read`/`pages_total`; `("units", rel, [(key, title, tf,
+    length), ...])` a code file's symbols; `("skip", rel, reason)` a PDF with no
+    text layer, or a sampled read that carried too little text to be worth
+    indexing; `("fail", rel, message)` a document that could not be read."""
     if rel.lower().endswith(".pdf"):
-        text, _pages, reason = _pdf_text(rel, root / rel)
+        full = root / rel
+        try:
+            size = full.stat().st_size
+        except OSError as e:
+            return ("fail", rel, str(e))
+        limit, oversize = _pdf_guard(full, size)
+        text, pages, reason, total = _pdf_text(rel, full, max_pages=limit)
         if not text:  # a scan, or a PDF PDFium could not open: `unconverted`, never indexed
             return ("skip", rel, reason)
+        truncated = bool(limit) and total > limit
+        if truncated:
+            read = len(pages)
+            if read and len(text) < _LOW_TEXT_CHARS_PER_PAGE * read:
+                code = "oversize_low_text" if oversize else "page_cap_low_text"
+                return ("skip", rel, f"{code}: {len(text)} chars from {read} of "
+                                     f"{total} pages, {size} bytes")
         tf, length = _prepare(Path(rel).stem, text)
-        return ("prose", rel, Path(rel).stem, tf, length)
+        note = ({"bytes": size, "pages_read": len(pages), "pages_total": total}
+                if truncated else None)
+        return ("prose", rel, Path(rel).stem, tf, length, note)
     if _is_code(rel):
         try:
             parts = _sections_of(rel)[1]
@@ -1010,18 +1032,29 @@ def _doc_result(rel: str, root: Path) -> tuple:
 
 
 def _apply_doc(store, result: tuple, mt: float, stamps: dict, skipped: dict,
-               units: dict) -> str:
+               units: dict, truncated: dict | None = None) -> str:
     """Apply one `_doc_result` to the store, the stamps and the unit map.
 
     The single writer both the sequential and the parallel pass share, so the
     two cannot drift: given the same documents in the same order the store lands
     byte for byte the same. Returns `"changed"`, `"skipped"` or `"failed"` (the
-    failure message stays in `result`; the caller records it)."""
+    failure message stays in `result`; the caller records it).
+
+    A PDF the oversize guard sampled is indexed from the pages it read, never
+    from all of them, so `truncated` (when the caller keeps one) records what it
+    read and what it skipped: the pass reports it, and a reader can see the
+    document is not fully indexed. It is cleared on a later full read."""
     tag, rel = result[0], result[1]
     if tag == "prose":
         store.upsert_prepared(rel, result[2], result[3], result[4])
         stamps[rel] = mt
         skipped.pop(rel, None)
+        if truncated is not None:
+            note = result[5] if len(result) > 5 else None
+            if note:
+                truncated[rel] = note
+            else:
+                truncated.pop(rel, None)
         return "changed"
     if tag == "units":
         payload = result[2]
@@ -1083,9 +1116,234 @@ def _index_timeout() -> float:
     return t if t > 0 else 0.0
 
 
+def _index_max_quarantine() -> int:
+    """`SILICA_INDEX_MAX_QUARANTINE`: documents one pass may quarantine after an
+    isolated retry, default 200; 0 means no cap.
+
+    A cap is what stops a corpus-wide crash (a broken PDFium build, a dead
+    mount returning garbage) from spending one subprocess and one timeout per
+    document: past it the pass records the reason and moves on."""
+    try:
+        n = int(os.environ.get("SILICA_INDEX_MAX_QUARANTINE", "200"))
+    except ValueError:
+        return 200
+    return n if n >= 0 else 200
+
+
+def _index_max_mb() -> float:
+    """`SILICA_INDEX_MAX_MB`: the size above which a PDF is sampled instead of
+    read whole, default 64; 0 disables the guard."""
+    try:
+        n = float(os.environ.get("SILICA_INDEX_MAX_MB", "64"))
+    except ValueError:
+        return 64.0
+    return n if n > 0 else 0.0
+
+
+def _index_max_pages() -> int:
+    """`SILICA_INDEX_MAX_PAGES`: pages one document may contribute to the index,
+    default 400; 0 disables the cap."""
+    try:
+        n = int(os.environ.get("SILICA_INDEX_MAX_PAGES", "400"))
+    except ValueError:
+        return 400
+    return n if n > 0 else 0
+
+
+# A sampled read is only worth indexing when it carries real text: 200
+# characters per 10 pages is the floor, one 20-character line a page. A page of
+# vector drawing yields a handful of characters, so a drawing set reads as
+# `oversize_low_text` instead of spending minutes to add nothing.
+_LOW_TEXT_CHARS_PER_PAGE = 20.0
+_DEFAULT_MAX_PAGES = 400
+_MIB = 1024 * 1024
+
+
+def _pdf_guard(full: Path, size: int) -> tuple[int, bool]:
+    """`(page_limit, oversize)` for one PDF, from its size alone.
+
+    `page_limit` is the number of pages the read may take (0 = no bound) and
+    `oversize` says the document is past `SILICA_INDEX_MAX_MB`. The size cap
+    implies a page bound even when `SILICA_INDEX_MAX_PAGES` is disabled: a cap
+    that still reads every page of a 400 MB file is not a cap."""
+    max_mb = _index_max_mb()
+    oversize = bool(max_mb) and size > max_mb * _MIB
+    limit = _index_max_pages()
+    if oversize and not limit:
+        limit = _DEFAULT_MAX_PAGES
+    return limit, oversize
+
+
+# Reasons a document is quarantined: the pool could not deliver it and an
+# isolated retry reproduced the failure, so this pass never touches it again.
+# Both are machine-readable, and both leave the document without a stamp — the
+# next pass re-runs it, which is the only way to notice a fixed environment.
+_QUARANTINE_CRASHED = "crashed_pdfium"
+_QUARANTINE_STALLED = "quarantined"
+_QUARANTINE_BUDGET = "quarantine_budget_exhausted"
+# The one line an isolated retry writes back: a tag so a chatty import or a
+# library's own warning on stdout cannot corrupt the result.
+_ISOLATE_MARKER = "SILICA_ISOLATE_RESULT "
+
+
+def _isolate_cmd(rel: str, root: Path | str) -> list[str]:
+    """The command that retries one document in a fresh interpreter.
+
+    A module entry point rather than an in-process fork: PDFium and MuPDF are
+    not thread-safe and `pypdfium2` initialises the library at import and
+    registers its destructor at exit, so a forked child inherits a library a
+    dead worker may have left half torn down. Tests redefine this to prove the
+    retry's failure paths without a native crash."""
+    return [sys.executable or "python3", "-m", "silica_core._isolate",
+            str(root), rel]
+
+
+def _isolated_retry(rel: str, root: Path, timeout: float | None):
+    """Retry one document alone in a new process: `(verdict, payload)`.
+
+    `verdict` is `"ok"` (payload is the `_doc_result` tuple), `"error"` (the
+    document failed in a way Python could report, payload is the message),
+    `"died"` (the process was killed or exited non-zero — the native crash this
+    exists for) or `"stalled"` (it outlived `timeout` and was killed)."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(_isolate_cmd(rel, root), capture_output=True,
+                              text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return "stalled", f"isolated retry exceeded {timeout}s"
+    except OSError as e:
+        return "error", f"isolated retry could not start: {e}"
+    if proc.returncode != 0:
+        return "died", f"isolated retry exited {proc.returncode}"
+    for line in reversed((proc.stdout or "").splitlines()):
+        if line.startswith(_ISOLATE_MARKER):
+            payload = orjson.loads(line[len(_ISOLATE_MARKER):])
+            if payload.get("kind") == "error":
+                return "error", payload.get("message") or "isolated retry failed"
+            return "ok", tuple(payload["value"])
+    return "died", "isolated retry wrote no result"
+
+
+def _discard_pool(pool, multiprocessing):
+    """Tear a broken pool down without waiting on it.
+
+    `cancel_futures` alone leaves a worker spinning on the document that killed
+    its sibling, and the interpreter waits for it at exit; terminating the
+    children is what actually stops the pass. Returns None so a caller can
+    assign the result over the pool it just dropped."""
+    pool.shutdown(wait=False, cancel_futures=True)
+    for child in multiprocessing.active_children():
+        child.terminate()
+        child.join(1)
+    return None
+
+
+def _run_generation(chunk, offset: int, total: int, root: Path, store, stamps: dict,
+                    skipped: dict, units: dict, failed: dict, truncated: dict,
+                    quarantined: set[str], n: int, timeout: float | None, progress):
+    """One generation of `SILICA_INDEX_BATCH` documents through a pool.
+
+    `todo` order is the store's order: a result is applied by this process as
+    soon as it is the earliest outstanding document, so a worker's finish time
+    never reaches the store. Every result the pool cannot deliver is handled
+    here: the document is retried alone in a fresh interpreter, and only if that
+    retry also dies or stalls is it quarantined and the pass moves on. Nothing
+    else in the generation is failed for it — the remaining documents are
+    re-submitted to a fresh pool, which is what stops one pathological file from
+    poisoning a batch.
+
+    Returns `(changed, worker_pids)`, mutating `failed`, `truncated` and
+    `quarantined` in place."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from concurrent.futures.process import BrokenProcessPool
+
+    root_str = str(root)
+    items = [(rel, root_str) for rel, _mt in chunk]
+    n_items = len(items)
+    window = max(4, n * 4)
+    cap = _index_max_quarantine()
+    # fork, explicitly: a worker inherits this build's root, config, index paths
+    # and the SILICA_INVENTORY parse through copied memory, so nothing has to be
+    # re-imported or re-resolved, and the tokenizer needs no warm-up.
+    ctx = multiprocessing.get_context("fork")
+    changed = 0
+    pids: set[int] = set()
+    i = submitted = 0
+    pool = None
+    in_flight: dict[int, Any] = {}
+    while i < n_items:
+        if pool is None:
+            pool = ProcessPoolExecutor(max_workers=n, mp_context=ctx,
+                                       initializer=_init_index_worker, initargs=(root_str,))
+            in_flight = {}
+            submitted = i
+        rel, mt = chunk[i]
+        if progress:
+            progress("index", offset + i, total)
+        try:
+            while submitted < min(i + window, n_items):
+                in_flight[submitted] = pool.submit(_index_worker, items[submitted])
+                submitted += 1
+        except BrokenProcessPool:
+            pass  # dead already: `result()` below reports it for this document
+        fut = in_flight.pop(i, None)
+        pid, result, why = None, None, None
+        try:
+            if fut is None:
+                why = "died"
+            else:
+                pid, result = fut.result(timeout=timeout)
+        except FutureTimeout:
+            why = "stalled"
+        except BrokenProcessPool:
+            why = "died"
+        except Exception as e:  # this document alone failed to read
+            failed[rel] = f"{type(e).__name__}: {e}"
+            i += 1
+            continue
+        if why is not None:
+            pool = _discard_pool(pool, multiprocessing)
+            if rel in quarantined:
+                i += 1
+                continue
+            if cap and len(quarantined) >= cap:
+                # Past the budget a corpus-wide crash would cost one subprocess
+                # and one timeout per document; the reason still reaches the
+                # caller and the pass still finishes.
+                quarantined.add(rel)
+                failed[rel] = _QUARANTINE_BUDGET
+                i += 1
+                continue
+            verdict, payload = _isolated_retry(rel, root, timeout)
+            if verdict in ("died", "stalled"):
+                quarantined.add(rel)
+                failed[rel] = _QUARANTINE_CRASHED if verdict == "died" else _QUARANTINE_STALLED
+                i += 1
+                continue
+            if verdict == "error":
+                failed[rel] = payload
+                i += 1
+                continue
+            result, pid = payload, None  # a retry's pid is not the fan-out's
+        if pid:
+            pids.add(pid)
+        outcome = _apply_doc(store, result, mt, stamps, skipped, units, truncated)
+        if outcome == "changed":
+            changed += 1
+        elif outcome == "failed":
+            failed[rel] = result[2]
+        i += 1
+    if pool is not None:
+        pool.shutdown(wait=True)
+    return changed, pids
+
+
 def _index_parallel(todo: list[tuple[str, float]], root: Path, store, stamps: dict,
                     skipped: dict, units: dict, failed: dict, meta: dict,
-                    progress) -> tuple[int, set[int]]:
+                    truncated: dict, progress) -> tuple[int, set[int]]:
     """The first pass across `SILICA_INDEX_PROCESSES` worker processes.
 
     Workers only read, extract and tokenize; every store mutation and every
@@ -1094,95 +1352,30 @@ def _index_parallel(todo: list[tuple[str, float]], root: Path, store, stamps: di
     futures is kept in flight rather than the whole `todo`, so a large corpus
     does not hold one Future per document.
 
-    The work is cut into generations of `SILICA_INDEX_BATCH` documents, each
-    flushed before the next opens, so progress survives a crash at batch
-    granularity and a long pass is observable while it runs.
+    The work is cut into generations of `SILICA_INDEX_BATCH` documents, and the
+    store is written once at each generation boundary — never on a timer. A
+    periodic full rewrite of a large index is what turns a slow pass into an I/O
+    storm: the store is hundreds of megabytes and `save()` serialises all of it.
 
-    Crash safety: a worker that dies mid-pass makes the pool report
-    `BrokenProcessPool`; a worker stuck on one document is cut off after
-    `SILICA_INDEX_TIMEOUT` seconds. Either way the pool is torn down (a stalled
-    worker is terminated — a cancelled Future would leave it spinning and the
-    interpreter would wait on it at exit), the document is reported in `failed`
-    and the next generation starts in a fresh pool. Every document not fully
-    applied keeps its previous stamp, or none, so nothing is written for a
-    document the parent did not fully receive: no row is partial, none is
-    duplicated, and the next pass re-runs exactly those documents.
+    Crash safety is per document, not per generation: see `_run_generation`.
+    Every document not fully applied keeps its previous stamp, or none, so
+    nothing is written for a document the parent did not fully receive: no row
+    is partial, none is duplicated, and the next pass re-runs exactly those.
 
     Returns `(changed, worker_pids)`, mutating `failed` in place."""
-    import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor
-    from concurrent.futures import TimeoutError as FutureTimeout
-    from concurrent.futures.process import BrokenProcessPool
-
-    n = _index_processes()
     batch = _index_batch()
+    n = _index_processes()
     timeout = _index_timeout() or None
-    root_str = str(root)
     changed = 0
     pids: set[int] = set()
-    last_flush = time.monotonic()
-    window = max(4, n * 4)
-    # fork, explicitly: a worker inherits this build's root, config, index paths
-    # and the SILICA_INVENTORY parse through copied memory, so nothing has to be
-    # re-imported or re-resolved, and the tokenizer needs no warm-up.
-    ctx = multiprocessing.get_context("fork")
+    quarantined: set[str] = set()  # never retried again in this pass
     for start in range(0, len(todo), batch):
-        chunk = todo[start:start + batch]
-        items = [(rel, root_str) for rel, _mt in chunk]
-        n_items = len(items)
-        broken = False
-        submitted = 0
-        in_flight: dict[int, Any] = {}
-        pool = ProcessPoolExecutor(max_workers=n, mp_context=ctx,
-                                   initializer=_init_index_worker, initargs=(root_str,))
-        try:
-            for local, (rel, mt) in enumerate(chunk):
-                if not broken:
-                    try:
-                        while submitted < min(local + window, n_items):
-                            in_flight[submitted] = pool.submit(_index_worker, items[submitted])
-                            submitted += 1
-                    except BrokenProcessPool:
-                        broken = True
-                if progress:
-                    progress("index", start + local, len(todo))
-                fut = in_flight.pop(local, None)
-                if not broken and fut is not None:
-                    try:
-                        pid, result = fut.result(timeout=timeout)
-                    except FutureTimeout:
-                        broken = True
-                        failed[rel] = _WORKER_STALLED
-                        continue
-                    except BrokenProcessPool:
-                        broken = True
-                        failed[rel] = _WORKER_DIED
-                        continue
-                    except Exception as e:  # this document alone failed to read
-                        failed[rel] = f"{type(e).__name__}: {e}"
-                        continue
-                else:
-                    failed[rel] = _WORKER_DIED
-                    continue
-                pids.add(pid)
-                outcome = _apply_doc(store, result, mt, stamps, skipped, units)
-                if outcome == "changed":
-                    changed += 1
-                elif outcome == "failed":
-                    failed[rel] = result[2]
-                if time.monotonic() - last_flush > _FLUSH_S:
-                    _flush(store, meta, failed)
-                    last_flush = time.monotonic()
-        finally:
-            if broken:
-                pool.shutdown(wait=False, cancel_futures=True)
-                for child in multiprocessing.active_children():
-                    child.terminate()
-                    child.join(1)
-            else:
-                pool.shutdown(wait=True)
-        _flush(store, meta, failed)
-        last_flush = time.monotonic()
+        got, used = _run_generation(todo[start:start + batch], start, len(todo), root,
+                                    store, stamps, skipped, units, failed, truncated,
+                                    quarantined, n, timeout, progress)
+        changed += got
+        pids |= used
+        _flush(store, meta, failed)  # at most one store write per generation
     return changed, pids
 
 
@@ -1190,9 +1383,10 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
                  allow_remote: bool = False, progress: Callable[[str, int, int], None] | None = None) -> dict:
     """Build or refresh the document index. Incremental by mtime; `rebuild`
     re-reads everything. Never raises for one unreadable file: it lands in
-    `failed` and in the failures file `silica_files` reports from. Saves
-    every `_FLUSH_S` seconds, so an interrupted build resumes where it
-    stopped. `live` is `_notes()` when the caller already walked."""
+    `failed` and in the failures file `silica_files` reports from. Saves once
+    per `SILICA_INDEX_BATCH` generation, so an interrupted build resumes at a
+    batch boundary instead of rewriting the whole store on a timer. `live` is
+    `_notes()` when the caller already walked."""
     meta = _load_meta()
     rebuild = rebuild or not meta.get("built_at")
     manifest = _manifest_inventory()
@@ -1248,8 +1442,8 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         stamps: dict[str, float] = meta["stamps"]
         skipped: dict[str, dict] = meta.setdefault("no_text", {})
         units: dict[str, list[str]] = meta.setdefault("units", {})  # code file -> its unit keys
+        truncated: dict[str, dict] = meta.setdefault("truncated", {})  # PDFs the guard sampled
         changed, failed = 0, {}
-        last_flush = time.monotonic()
         todo = [(rel, mt) for rel, mt in live.items()
                 if rebuild or not (stamps.get(rel) == mt or skipped.get(rel, {}).get("mtime") == mt)]
         n_proc = _index_processes()
@@ -1259,26 +1453,30 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
             # applies every result in `todo` order as the single writer, so a
             # worker's finish time cannot reorder the store.
             changed, worker_pids = _index_parallel(
-                todo, root, store, stamps, skipped, units, failed, meta, progress)
+                todo, root, store, stamps, skipped, units, failed, meta, truncated, progress)
         else:
-            for done, (rel, mt) in enumerate(todo, 1):
-                if progress:
-                    progress("index", done - 1, len(todo))
-                result = _doc_result(rel, root)
-                outcome = _apply_doc(store, result, mt, stamps, skipped, units)
-                if outcome == "changed":
-                    changed += 1
-                elif outcome == "failed":
-                    failed[rel] = result[2]
-                if time.monotonic() - last_flush > _FLUSH_S:
-                    _flush(store, meta, failed)
-                    last_flush = time.monotonic()
+            # Generations here too, so the store is serialised once per
+            # SILICA_INDEX_BATCH documents and not once per flush interval: a
+            # full rewrite of a large index every few seconds drowns the pass.
+            batch = _index_batch()
+            for start in range(0, len(todo), batch):
+                for done, (rel, mt) in enumerate(todo[start:start + batch], start + 1):
+                    if progress:
+                        progress("index", done - 1, len(todo))
+                    result = _doc_result(rel, root)
+                    outcome = _apply_doc(store, result, mt, stamps, skipped, units, truncated)
+                    if outcome == "changed":
+                        changed += 1
+                    elif outcome == "failed":
+                        failed[rel] = result[2]
+                _flush(store, meta, failed)
         if progress and todo:
             progress("index", len(todo), len(todo))
         for gone in [p for p in list(stamps) + list(skipped) if p not in live]:
             stamps.pop(gone, None)
             skipped.pop(gone, None)
             units.pop(gone, None)
+            truncated.pop(gone, None)
             _extract_cache(gone).unlink(missing_ok=True)  # a deleted PDF leaves no extraction behind
         for gone in [p for p in store.paths() if _split_key(p)[0] not in live]:
             store.remove(gone)
@@ -1289,6 +1487,11 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
                  "built_at": meta["built_at"], "pending": len(failed),
                  "inventory": _inventory_block(live)}
         out = {"docs": len(stamps), "changed": changed, "failed": failed, "index": state}
+        if truncated:
+            # Present only when the oversize guard sampled something: a document
+            # indexed from part of its pages is reported, never passed off as
+            # whole. The next pass reads it again only if it changed.
+            out["truncated"] = dict(truncated)
         if worker_pids:
             # Present only when the fan-out ran: a single-process pass carries no
             # such key, so `SILICA_INDEX_PROCESSES` unset and `=1` stay identical.
@@ -1592,7 +1795,7 @@ def _sections_of(key: str) -> tuple[str, list[tuple[int, str, Counter, int, str]
     stamp = (rel, _identity_stamp(rel, full))
     if stamp not in _section_cache:
         if full.suffix.lower() == ".pdf":
-            text, pages, _reason = _pdf_text(rel, full)
+            text, pages, _reason, _total = _pdf_text(rel, full)
             bounds = [p["offset"] for p in pages] + [len(text)]
             parts = [(p["offset"], text[p["offset"]:bounds[i + 1]], f"p. {p['page']}")
                      for i, p in enumerate(pages)]
@@ -1949,7 +2152,7 @@ def _served(rel: str) -> dict:
             source_state = _source_state(full, text)
             source, rel = rel, sidecar.relative_to(root).as_posix()
         elif full.suffix.lower() == ".pdf":
-            text, pages, reason = _pdf_text(rel, full)
+            text, pages, reason, _total = _pdf_text(rel, full)
             if not text:
                 return _error("unconverted", f"{reason} in {rel}; run `silica-core import {rel}`")
             source, paged = rel, True

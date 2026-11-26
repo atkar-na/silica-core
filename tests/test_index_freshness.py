@@ -47,7 +47,7 @@ def test_a_drift_past_the_budget_is_served_stale(root, tmp_path, monkeypatch):
 
 
 def test_an_interrupted_build_resumes_where_it_stopped(root, tmp_path, monkeypatch):
-    monkeypatch.setattr(root, "_FLUSH_S", 0.0)  # flush after every document
+    monkeypatch.setenv("SILICA_INDEX_BATCH", "1")  # a generation is one document
     real_read = root._read
     seen = []
 

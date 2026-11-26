@@ -132,7 +132,7 @@ def test_a_legacy_bare_list_with_a_changed_stamp_is_re_extracted(root, tmp_path,
     _replace_in_place(pdf, b"%PDF-1.4 bravo")
     monkeypatch.setenv("SILICA_INVENTORY", str(_manifest(tmp_path, {"docs/scan.pdf": 200.0})))
 
-    text, _pages, _reason = root._pdf_text("docs/scan.pdf", pdf)
+    text, _pages, _reason, _total = root._pdf_text("docs/scan.pdf", pdf)
     assert "bravo" in text and "alpha" not in text, "the changed stamp must not serve the old text"
     assert len(extractions) == 1, "the bare list must be re-extracted, not reused on mtime"
     payload = json.loads(root._extract_cache("docs/scan.pdf").with_suffix(".json").read_bytes())
@@ -150,11 +150,11 @@ def test_a_legacy_bare_list_is_migrated_on_read_then_reused_while_the_stamp_hold
     _legacy_artifact(root, "docs/scan.pdf", "stale\n\n", [{"page": 1, "line": 1, "offset": 0}])
     monkeypatch.setenv("SILICA_INVENTORY", str(_manifest(tmp_path, {"docs/scan.pdf": 100.0})))
 
-    first, _pages, _reason = root._pdf_text("docs/scan.pdf", pdf)
+    first, _pages, _reason, _total = root._pdf_text("docs/scan.pdf", pdf)
     assert "alpha" in first and "stale" not in first
     assert len(extractions) == 1, "the unstamped artifact is re-extracted once"
 
-    second, _pages, _reason = root._pdf_text("docs/scan.pdf", pdf)
+    second, _pages, _reason, _total = root._pdf_text("docs/scan.pdf", pdf)
     assert second == first
     assert len(extractions) == 1, "an unchanged stamp reuses the now-stamped artifact"
 
@@ -169,7 +169,7 @@ def test_a_legacy_bare_list_with_no_manifest_keeps_the_mtime_reuse(root, tmp_pat
     pages = [{"page": 1, "line": 1, "offset": 0}]
     _legacy_artifact(root, "docs/scan.pdf", "cached\n\n", pages)
 
-    text, got_pages, _reason = root._pdf_text("docs/scan.pdf", pdf)
+    text, got_pages, _reason, _total = root._pdf_text("docs/scan.pdf", pdf)
     assert text.strip() == "cached" and got_pages == pages
     assert extractions == [], "no manifest: an unchanged mtime still reuses the old artifact"
 
@@ -185,7 +185,7 @@ def test_the_current_form_still_detects_a_changed_stamp(root, tmp_path, monkeypa
     _replace_in_place(pdf, b"%PDF-1.4 bravo")
     monkeypatch.setenv("SILICA_INVENTORY", str(_manifest(tmp_path, {"docs/scan.pdf": 2.0})))
 
-    text, _pages, _reason = root._pdf_text("docs/scan.pdf", pdf)
+    text, _pages, _reason, _total = root._pdf_text("docs/scan.pdf", pdf)
     assert "bravo" in text and "alpha" not in text
     assert len(extractions) == 2
 

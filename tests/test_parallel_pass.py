@@ -14,8 +14,9 @@ What this pins:
   4-process pass writes a byte-identical store to a 1-process pass, so a
   worker's finish order can never leak into the file;
 * unset == 1 — the flag simply absent is exactly the single-process pass;
-* crash safety — a worker killed mid-pass is surfaced as a failure, leaves the
-  store valid, and a re-run finishes every document with none lost, none doubled;
+* crash safety — a worker killed mid-pass costs exactly the document it was
+  reading: that document is retried alone in a fresh interpreter, the rest of
+  the generation is not failed for it, and a re-run finishes everything;
 * both answering sources — the pass works with `SILICA_INVENTORY` set and with
   the walk;
 * the fan-out is real — the parallel mode reports the worker pids it used, which
@@ -26,12 +27,13 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sys
 import time
 
 import orjson
 import pytest
 
-from silica_core.core import _WORKER_DIED
+from silica_core.core import _QUARANTINE_CRASHED
 
 
 @pytest.fixture
@@ -145,9 +147,10 @@ def test_the_parallel_mode_really_fans_out(corpus, tmp_path, monkeypatch):
     assert out["parallel"]["workers"] >= 2, "the flag must actually engage worker processes"
 
 
-def test_a_killed_worker_leaves_the_store_consistent_and_a_rerun_completes(corpus, tmp_path, monkeypatch):
-    """(c): a worker killed mid-pass is surfaced, the store stays a valid
-    document, and a re-run finishes every document — none lost, none duplicated."""
+def test_a_killed_worker_costs_only_the_document_it_was_reading(corpus, tmp_path, monkeypatch):
+    """(c): a worker killed mid-pass is not a generation-wide failure. The
+    document is retried alone in a fresh interpreter — which here does not carry
+    the injected killer — and the pass completes; nothing is lost or doubled."""
     core, root_dir, _ = corpus
     real = core._doc_result
     victim = "n3.md"
@@ -161,21 +164,39 @@ def test_a_killed_worker_leaves_the_store_consistent_and_a_rerun_completes(corpu
     monkeypatch.setattr(core, "_doc_result", killer)
     idx = tmp_path / "idx"
     out, blob = _pass(core, monkeypatch, idx, processes=4)
-    assert out["failed"], "a killed worker must be reported, never a silent success"
-    assert out["index"]["state"] == "stale"
-    assert victim in out["failed"] or _WORKER_DIED in out["failed"].values()
-    # the store on disk is still a valid, consistent document with no partial row
+    assert out["failed"] == {}, f"one dead worker failed the whole generation: {out['failed']}"
+    assert out["index"]["state"] == "ready"
     loaded = orjson.loads(blob)
-    assert set(loaded["docs"]) <= {f"n{i}.md" for i in range(6)}
+    assert set(loaded["docs"]) == {f"n{i}.md" for i in range(6)}
     assert set(loaded["len"]) == set(loaded["docs"])
 
-    # the re-run finishes the documents the dead worker never delivered
+    # a re-run sees nothing left to do
     monkeypatch.setattr(core, "_doc_result", real)
     out2, blob2 = _pass(core, monkeypatch, idx, processes=4)
-    assert out2["failed"] == {}
-    assert out2["index"]["state"] == "ready"
-    assert out2["docs"] == 6
-    loaded2 = orjson.loads(blob2)
-    assert set(loaded2["docs"]) == {f"n{i}.md" for i in range(6)}
-    assert len(loaded2["docs"]) == 6   # none lost, none duplicated
-    assert set(loaded2["len"]) == set(loaded2["docs"])
+    assert out2["failed"] == {} and out2["changed"] == 0
+    assert orjson.loads(blob2) == loaded
+
+
+def test_a_worker_that_cannot_be_retried_is_quarantined(corpus, tmp_path, monkeypatch):
+    """When the isolated retry reproduces the crash, the document is recorded
+    with a machine-readable reason and the pass still finishes."""
+    core, root_dir, _ = corpus
+    real = core._doc_result
+    victim = "n3.md"
+
+    def killer(rel, root_dir):
+        if rel == victim:
+            os.kill(os.getpid(), signal.SIGKILL)
+        return real(rel, root_dir)
+
+    monkeypatch.setattr(core, "_doc_result", killer)
+    monkeypatch.setattr(
+        core, "_isolate_cmd",
+        lambda rel, root: [sys.executable, "-c", "raise SystemExit(3)"])
+    monkeypatch.setenv("SILICA_INDEX_BATCH", "1")  # one document per generation
+    out, blob = _pass(core, monkeypatch, tmp_path / "idx", processes=4)
+    assert out["failed"] == {victim: _QUARANTINE_CRASHED}
+    assert out["index"]["state"] == "stale"
+    loaded = orjson.loads(blob)
+    assert victim not in loaded["docs"]
+    assert len(loaded["docs"]) == 5

@@ -188,17 +188,23 @@ def test_a_raised_threshold_honours_the_smaller_manifest_on_a_rebuild(root, tmp_
 
 
 # ---------------------------------------------------------------------------
-# c. the intended path is intact: the walk stays the authority
-# ---------------------------------------------------------------------------
+# c. the intended path is intact: the manifest is the authority
 
-def test_a_complete_manifest_still_prunes_and_indexes_normally(root, tmp_path, monkeypatch):
-    """A manifest that matches the walk is not refused: it prunes the row the
-    corpus really lost and indexes what remains."""
+def test_a_manifest_that_shrank_is_honoured_when_the_operator_says_so(root, tmp_path, monkeypatch):
+    """The manifest is the authority, and a manifest that names fewer rows than
+    the store cannot be told apart from a truncated write. The default refuses
+    it; an operator whose corpus really shrank says so with the threshold the
+    prune guard already reads, and the pass then prunes and continues."""
     root.build_index()
     (root._root() / "docs" / "ctree.md").unlink()
     data = _manifest(root)  # the current root: two rows
     monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, data)))
 
+    refused = root.build_index()
+    assert refused["error"]["code"] == "inventory_prune_refused", "1 of 3 rows is a subset write"
+    assert root.index_state()["docs"] == 3
+
+    monkeypatch.setenv("SILICA_INVENTORY_MAX_DROP", "0.5")
     out = root.build_index()
 
     assert "error" not in out

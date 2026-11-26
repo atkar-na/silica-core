@@ -437,6 +437,13 @@ class DiskSynced:
             self._take_disk(self._read_disk())
         return True
 
+    def on_disk(self) -> bool:
+        """Whether the file this store writes exists yet.
+
+        A build that never saved anything still has to write once, or the
+        absence of the file reads as a cold index rather than an empty one."""
+        return self._path.is_file()
+
     def is_dirty(self) -> bool:
         """True when this store holds something the file does not.
 

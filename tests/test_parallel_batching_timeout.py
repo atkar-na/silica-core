@@ -11,8 +11,10 @@ What this pins:
 * a worker stuck on a document is abandoned after the timeout and the pass
   still finishes the other documents in a fresh pool — without the limit the
   parent waits on that future forever;
-* the abandoned document is named in `failed`, so the next pass re-runs it and
-  nobody has to guess which file stalled the run;
+* the stalled document is retried alone in a fresh interpreter (which, here,
+  is not carrying the injected stall) and the pass indexes it, so the reason a
+  document is quarantined is always reproduced, never a guess at which future
+  the broken pool belonged to;
 * both limits parse sanely and default off/on as documented.
 """
 from __future__ import annotations
@@ -23,7 +25,7 @@ import time
 
 import pytest
 
-from silica_core.core import _WORKER_STALLED, _index_batch, _index_timeout
+from silica_core.core import _index_batch, _index_timeout
 
 
 def _stalling_worker(item):
@@ -117,7 +119,7 @@ def test_each_generation_flushes_the_store(corpus, monkeypatch):
     assert result["index"]["state"] in ("ready", "stale")
 
 
-def test_a_stalled_document_is_abandoned_and_the_pass_finishes(corpus, monkeypatch):
+def test_a_stalled_document_is_isolated_and_the_pass_finishes(corpus, monkeypatch):
     core, root_dir, tmp = corpus
     manifest = _manifest(tmp, root_dir)
     index_dir = root_dir / ".idx"
@@ -126,7 +128,8 @@ def test_a_stalled_document_is_abandoned_and_the_pass_finishes(corpus, monkeypat
     monkeypatch.setenv("SILICA_TEST_STALL_REL", "n3.md")
     result, wall = _run(core, monkeypatch, index_dir, batch=2, timeout=3, manifest=manifest)
     assert wall < 30, f"the pass waited {wall:.1f}s on the stalled document"
-    assert "n3.md" in result["failed"], result["failed"]
-    assert result["failed"]["n3.md"] == _WORKER_STALLED
+    # the stall lived in the pool worker; the retry is a fresh interpreter, so
+    # the document is read normally and nothing is failed for it
+    assert result["failed"] == {}, result["failed"]
     docs = _docs(index_dir)
-    assert set(docs) == {"n0.md", "n1.md", "n2.md", "n4.md", "n5.md"}, sorted(docs)
+    assert set(docs) == {f"n{i}.md" for i in range(6)}, sorted(docs)

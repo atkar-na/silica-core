@@ -165,13 +165,13 @@ def test_a_pdf_replaced_in_place_is_re_extracted(root, tmp_path, monkeypatch):
     full = tmp_path / "docs" / "scan.pdf"
     monkeypatch.setenv("SILICA_INVENTORY", str(_manifest(tmp_path, {"docs/scan.pdf": 1.0})))
 
-    text, _pages, _reason = root._pdf_text("docs/scan.pdf", full)
+    text, _pages, _reason, _total = root._pdf_text("docs/scan.pdf", full)
     assert "alpha" in text
 
     _replace_in_place(pdf, b"%PDF-1.4 bravo")
     monkeypatch.setenv("SILICA_INVENTORY", str(_manifest(tmp_path, {"docs/scan.pdf": 2.0})))
 
-    text, _pages, _reason = root._pdf_text("docs/scan.pdf", full)
+    text, _pages, _reason, _total = root._pdf_text("docs/scan.pdf", full)
     assert "bravo" in text and "alpha" not in text, "the replaced PDF must be re-extracted"
     assert len(extractions) == 2, "extraction must run again for a replaced source"
 

@@ -47,6 +47,17 @@ STALE_BUDGET = 50
 # store under a search. ponytail: searches serialise too; a reader-writer
 # lock if a client ever fans them out.
 _STORE_RW = threading.RLock()
+# Directories a walk could not list — permission denied, a dead mount, an
+# unreadable subdirectory. `os.walk` calls `onerror` and otherwise continues as
+# if the directory were empty, so a failed traversal is indistinguishable from a
+# genuinely empty root; `_walk` appends every unlistable directory here. A
+# build or a state report sets a fresh list for the duration of one walk and
+# refuses to treat a result with entries as the corpus. A ContextVar, not a
+# module global, because the MCP server serves requests on a thread pool: one
+# request must never read another request's failures. Unset outside such a
+# scope, where a partial walk has no consumer to tell.
+_walk_failures: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "silica_walk_failures", default=None)
 # Seconds between partial saves during a build, so Ctrl+C at 90% of a cold
 # build keeps the 90% and the next run does the rest (save() is hundreds of
 # ms on a big index, so not per document).
@@ -359,11 +370,25 @@ def _walk(base: Path | None = None):
     did not enter or list as (rel + "/", None) for a directory and (rel, None)
     for a file: hidden names, NOISE_DIRS, and `.silicaignore`, on files and
     directories alike. String paths and one relpath per directory: pathlib
-    per file was 5 s of a 3 s search over 5k files (profiled 2026-09-09)."""
+    per file was 5 s of a 3 s search over 5k files (profiled 2026-09-09).
+
+    A directory `os.walk` cannot list — permission denied, a dead mount, an
+    unreadable subdirectory — is reported to `_walk_failures` and not silently
+    skipped: without this the traversal looks exactly like an empty root and a
+    build prunes the index to nothing. A caller that needs the corpus (a build,
+    a state report) sets that list and refuses a result the walk could not
+    complete; a caller listing files ignores it and sees what the walk saw."""
     root = _root()
     root_s = str(root)
     skip = _paths.ignore_path_matcher(root)
-    for dirpath, dirnames, filenames in os.walk(base or root):
+
+    def onerror(exc: OSError) -> None:
+        sink = _walk_failures.get()
+        if sink is not None:
+            where = getattr(exc, "filename", None) or "?"
+            sink.append(f"{where}: {exc}")
+
+    for dirpath, dirnames, filenames in os.walk(base or root, onerror=onerror):
         rel_dir = os.path.relpath(dirpath, root_s).replace(os.sep, "/")
         prefix = "" if rel_dir == "." else rel_dir + "/"
         keep = []
@@ -635,19 +660,40 @@ def index_state(meta: dict | None = None, live: dict[str, float] | None = None) 
     never built. `pending` counts what the index has not caught up with:
     documents changed or new since their stamp, and stamped documents gone from
     disk. `inventory` says which source answered — a manifest or the walk — and
-    how old it is. `live` is `_notes()` when the caller already walked."""
+    how old it is. `live` is `_notes()` when the caller already walked.
+
+    A walk that could not list a directory is surfaced, never reported `ready`:
+    the state is `stale` and an `error` block names the directories. Otherwise a
+    failed mount would read as a corpus with everything deleted, which is what a
+    search or a build then acts on."""
     meta = meta or _load_meta()
     if not _paths.index_file(INDEX).is_file() or not meta.get("built_at"):
         return {"state": "cold", "docs": 0, "built_at": None, "inventory": _inventory_block()}
-    live = _notes() if live is None else live
+    failures: list[str] = []
+    walk_failed = False
+    if live is None:
+        token = _walk_failures.set(failures)
+        try:
+            live = _notes()
+        except Exception as e:  # a walk that raised outright, not just skipped a directory
+            failures.append(str(e))
+            live = {}
+        finally:
+            _walk_failures.reset(token)
+        walk_failed = bool(failures)
     stamps = meta.get("stamps", {})
     skipped = meta.get("no_text", {})
     pending = sum(1 for r, mt in live.items()
                   if stamps.get(r) != mt and skipped.get(r, {}).get("mtime") != mt)
     pending += sum(1 for r in stamps if r not in live)
-    return {"state": "stale" if pending else "ready", "docs": len(stamps),
-            "built_at": meta.get("built_at"), "pending": pending,
-            "inventory": _inventory_block(live)}
+    out = {"state": "stale" if (pending or walk_failed) else "ready", "docs": len(stamps),
+           "built_at": meta.get("built_at"), "pending": pending,
+           "inventory": _inventory_block(live)}
+    if walk_failed:
+        out["error"] = {"code": "inventory_walk_failed", "failures": failures,
+                        "hint": f"the walk under {_root()} could not list {len(failures)} "
+                                "directory(ies); the state is not this corpus"}
+    return out
 
 
 def _flush(store, meta: dict, failed: dict) -> None:
@@ -701,7 +747,8 @@ def _max_drop() -> float:
     return frac if 0.0 <= frac <= 1.0 else 0.1
 
 
-def _guard_live(live: dict[str, float], unextracted: list[str], meta: dict):
+def _guard_live(live: dict[str, float], unextracted: list[str], meta: dict,
+                errors: list[str] | None = None):
     """The walk is the truth; a manifest is trusted only where it agrees with it.
 
     A manifest that omits rows the walk can see is not a smaller corpus, it is a
@@ -710,14 +757,22 @@ def _guard_live(live: dict[str, float], unextracted: list[str], meta: dict):
     manifest-driven pass the walk is taken once more as the authority whenever
     the two disagree, and the build then follows the walk.
 
-    When the walk cannot run at all — a manifest-only deployment, a share that
-    is down — the manifest is honoured only while it removes at most
+    A walk is usable only if it ran *and* listed every directory: `errors` (the
+    same list `_walk` appends to) holds the directories it could not list, and a
+    non-empty addition means the result is not a corpus — exactly as when the
+    walk raises and cannot run at all. `errors` defaults to the ambient list.
+
+    When the walk is unusable — a manifest-only deployment, a share that is
+    down — the manifest is honoured only while it removes at most
     `SILICA_INVENTORY_MAX_DROP` of the stored rows; past that the pass returns an
     `inventory_prune_refused` error without writing, so the store is left
     byte-identical and the caller sees the counts. The error carries `index`, so
     a search that triggered this build serves the store it already has and
     reports it stale rather than failing.
     """
+    if errors is None:
+        errors = _walk_failures.get() or []
+    mark = len(errors)
     stamps: dict[str, float] = meta.get("stamps", {})
     skipped: dict[str, dict] = meta.get("no_text", {})
     walk_unextracted: list[str] = []
@@ -725,7 +780,7 @@ def _guard_live(live: dict[str, float], unextracted: list[str], meta: dict):
         walk_live, walk_unextracted = _inventory(base=_root())
     except Exception:
         walk_live = None
-    if walk_live is not None:
+    if walk_live is not None and len(errors) == mark:
         if set(live) == set(walk_live) and set(unextracted) == set(walk_unextracted):
             return live, unextracted
         return walk_live, walk_unextracted
@@ -750,6 +805,49 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
     stopped. `live` is `_notes()` when the caller already walked."""
     meta = _load_meta()
     rebuild = rebuild or not meta.get("built_at")
+    manifest = _manifest_inventory()
+    root = _root()
+    # Resolve the live set and reconcile it with the walk before anything is
+    # written and before a rebuild clears the store, so a rebuild driven by a
+    # subset manifest, or a walk that could not list a directory, aborts with
+    # the store still on disk. `errors` is where `_walk` reports the directories
+    # it could not list for the walks this pass runs.
+    errors: list[str] = []
+    token = _walk_failures.set(errors)
+    try:
+        if live is None:
+            # `_inventory()` answers from the manifest when one is set, and
+            # walks otherwise: a manifest-driven pass does not traverse.
+            try:
+                live, unextracted = _inventory()
+            except Exception as e:
+                return _error("inventory_walk_failed",
+                              f"the walk failed under {root}: {e}; the index is left untouched",
+                              docs=len(meta.get("stamps", {})), changed=0, index=index_state(meta))
+        else:
+            unextracted = manifest["unextracted"] if manifest is not None else []
+        if manifest is not None:
+            # Prune guard, on the incremental *and* the rebuild path: the walk is
+            # the authority, and a manifest that disagrees with it — a subset, a
+            # truncated write, a stale file — is replaced by the walk's own set
+            # rather than pruning the rows it omits; when the walk cannot run, one
+            # pass may remove at most `SILICA_INVENTORY_MAX_DROP` of the stored
+            # rows and otherwise aborts before anything is written.
+            errors.clear()  # only the guard's own walk counts
+            guarded = _guard_live(live, unextracted, meta, errors)
+            if isinstance(guarded, dict):
+                return guarded
+            live, unextracted = guarded
+        elif errors:
+            # No manifest to fall back on and the walk could not list a
+            # directory: the result is not a corpus, so nothing is pruned.
+            return _error("inventory_walk_failed",
+                          f"the walk could not list {len(errors)} directory(ies) under {root}; "
+                          "refusing to treat a partial walk as the corpus",
+                          docs=len(meta.get("stamps", {})), changed=0,
+                          failures=list(errors), index=index_state(meta))
+    finally:
+        _walk_failures.reset(token)
     if rebuild:
         meta = {"built_at": None, "stamps": {}, "no_text": {}, "tokenizer": TOKENIZER_VERSION}
     with _STORE_RW:  # the store is filled here; no search reads it meanwhile
@@ -760,24 +858,6 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         stamps: dict[str, float] = meta["stamps"]
         skipped: dict[str, dict] = meta.setdefault("no_text", {})
         units: dict[str, list[str]] = meta.setdefault("units", {})  # code file -> its unit keys
-        root = _root()
-        manifest = _manifest_inventory()
-        if live is None:
-            # `_inventory()` answers from the manifest when one is set, and
-            # walks otherwise: a manifest-driven pass does not traverse.
-            live, unextracted = _inventory()
-        else:
-            unextracted = manifest["unextracted"] if manifest is not None else []
-        # Prune guard: the walk is the authority. A manifest that disagrees with
-        # it — a subset, a truncated write, a stale file — is replaced by the
-        # walk's own set rather than pruning the rows it omits; when the walk
-        # cannot run, one pass may remove at most `SILICA_INVENTORY_MAX_DROP` of
-        # the stored rows and otherwise aborts before anything is written.
-        if not rebuild and manifest is not None:
-            guarded = _guard_live(live, unextracted, meta)
-            if isinstance(guarded, dict):
-                return guarded
-            live, unextracted = guarded
         changed, failed = 0, {}
         last_flush = time.monotonic()
         todo = [(rel, mt) for rel, mt in live.items()

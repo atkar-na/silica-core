@@ -38,6 +38,43 @@ test, not an aspiration.
    comparison when it is not.
 3. **Optional bounded reader concurrency**, off by default, only if a measurement on the target mount
    shows it helps — a previous attempt at parallelism measured *slower* at N=8 and was reverted.
+4. **A byte source over HTTP.** `SILICA_SOURCE_URL` names an endpoint that serves each document by
+   key and honours `Range`; the index pass then reads every document through it, a bounded number of
+   streams ahead of extraction, into a temporary local file. Unset, the pass reads the tree exactly as
+   upstream does.
+
+### The byte source (`SILICA_SOURCE_URL`)
+
+A remote tree reaches the pass through a network mount, and on that mount the bytes are the cost:
+extraction is milliseconds and the read is seconds. The same objects are usually also reachable
+through a plain HTTP endpoint that answers `Range`, so the pass can pull them on a bounded pool of
+streams and hand the extractor a local file — extraction itself is unchanged, and so is everything
+downstream of it.
+
+| Variable | Meaning |
+|---|---|
+| `SILICA_SOURCE_URL` | base URL of the endpoint; a document's key is appended, quoted per segment. Unset = filesystem, byte-for-byte the upstream path. |
+| `SILICA_SOURCE_STREAMS` | concurrent streams, default `24`. Also the pool size. |
+| `SILICA_SOURCE_CHUNK_MB` | bytes per Range request, default `4`. |
+| `SILICA_SOURCE_TIMEOUT` | seconds per request, default `60`. |
+| `SILICA_SOURCE_AUTH` | one optional request header, `Header-Name: value`; `SILICA_SOURCE_AUTH_VALUE` supplies the value alone when the name sits in the first. The token is never a file in this repository. |
+
+Two invariants hold this together, and `tests/test_source.py` asserts both without a network (a
+Range-capable `http.server` over a temporary directory stands in for an endpoint):
+
+- **The same documents produce the same store.** The pipeline hands files over in the pass's own
+  order, whatever order the downloads finish in, and each fetched copy takes the modification time
+  the inventory reported so the extraction caches key on the same identity they do on disk. A pass
+  over a tree and a pass over the same bytes served over HTTP write byte-identical `lexical.json` and
+  the same `stamps.json`.
+- **Failure is per document, cleanup is per pass.** A document the endpoint will not serve (a 5xx past
+  the retry budget, a size that disagrees with the expected one) lands in `failed` like an unreadable
+  file does, and the pass continues. Downloads run a bounded window ahead of extraction — at most
+  `streams × 2` files exist that are downloaded and not yet extracted — and the whole work directory
+  is removed when the pass leaves, by exception or by Ctrl+C as well as by finishing.
+
+The provider lives in `silica_core/source.py` (`Fetcher`, `Prefetcher`); the pass only chooses a
+source, at `core._source_documents`.
 
 The five-tool reply contract (`silica_files`, `silica_search`, `silica_read`, `silica_code_pack`,
 `silica_write_note`) and the token stream (`TOKENIZER_VERSION`) are frozen: a change to either is a

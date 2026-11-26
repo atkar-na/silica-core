@@ -6,6 +6,7 @@ code_pack, write_note. The CLI and the MCP server wrap these. Nothing here
 calls a model; the root is the folder Silica was started in (or --vault)."""
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import functools
 import hashlib
@@ -342,6 +343,51 @@ def _doc_text(rel: str) -> str:
     """What the index reads for one document: a note's bytes, a PDF's text layer."""
     full = _root() / rel
     return _pdf_text(rel, full)[0] if full.suffix.lower() == ".pdf" else _read(full)
+
+
+def _stamp_copy(path: Path, stamp: float) -> None:
+    """Give a fetched copy the modification time the inventory reported.
+
+    The extraction caches key a document on its identity stamp, which without
+    a manifest is the file's own mtime; a fresh temp file carries the wall
+    clock, so without this every fetched document would miss its cache on
+    every pass. A manifest stamp can be a digest rather than a time, in which
+    case the caches key on the digest and there is nothing to copy.
+    """
+    try:
+        if 0 <= float(stamp) < 1e11:
+            os.utime(path, (stamp, stamp))
+    except (OSError, TypeError, ValueError, OverflowError):
+        pass
+
+
+def _source_documents(todo: list[tuple[str, float]], root: Path):
+    """`(rel, stamp, path)` per document, in `todo` order.
+
+    With `SILICA_SOURCE_URL` unset this is the file itself under the root, and
+    the pass behaves exactly as it always has. With it set the bytes arrive
+    over HTTP, a bounded number of streams ahead of this loop, as local files,
+    so the extraction below never waits on the network; the order is the
+    pass's, not the network's, so the same documents produce the same store
+    whichever download finishes first.
+    """
+    from silica_core.source import SourceConfig, prefetch
+
+    config = SourceConfig.from_env()
+    if config is None:
+        for rel, mt in todo:
+            yield rel, mt, root / rel
+        return
+    stamps = dict(todo)
+    with prefetch(config, workdir=_paths.index_dir() / "tmp") as ahead:
+        for rel, copy, error in ahead.materialize([rel for rel, _mt in todo]):
+            if copy is None:
+                # One document the source would not serve is a failure the
+                # index records, exactly as an unreadable file is on disk.
+                yield rel, stamps[rel], error
+                continue
+            _stamp_copy(copy, stamps[rel])
+            yield rel, stamps[rel], copy
 
 
 def _is_text(full: Path) -> bool:
@@ -978,7 +1024,7 @@ def _index_processes() -> int:
     return n if n >= 1 else 1
 
 
-def _doc_result(rel: str, root: Path) -> tuple:
+def _doc_result(rel: str, root: Path, full: Path | None = None) -> tuple:
     """The read, extract and tokenize half of the first pass for one document,
     with no store mutation: a tagged tuple the caller applies.
 
@@ -992,8 +1038,8 @@ def _doc_result(rel: str, root: Path) -> tuple:
     length), ...])` a code file's symbols; `("skip", rel, reason)` a PDF with no
     text layer, or a sampled read that carried too little text to be worth
     indexing; `("fail", rel, message)` a document that could not be read."""
+    full = root / rel if full is None else Path(full)
     if rel.lower().endswith(".pdf"):
-        full = root / rel
         try:
             size = full.stat().st_size
         except OSError as e:
@@ -1448,28 +1494,36 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
                 if rebuild or not (stamps.get(rel) == mt or skipped.get(rel, {}).get("mtime") == mt)]
         n_proc = _index_processes()
         worker_pids: set[int] = set()
-        if n_proc > 1 and len(todo) > 1:
-            # The opt-in fan-out: workers read/extract/tokenize, this process
-            # applies every result in `todo` order as the single writer, so a
-            # worker's finish time cannot reorder the store.
+        # A fetched source drives the serial, prefetch-fed loop: the parent pulls
+        # documents in order from a bounded window of downloads, so extraction is
+        # never waiting on the network, and the worker pool buys nothing while the
+        # transfer is the ceiling. With no source the pool is the lever it always was.
+        from_source = bool(os.environ.get("SILICA_SOURCE_URL", "").strip())
+        if n_proc > 1 and len(todo) > 1 and not from_source:
             changed, worker_pids = _index_parallel(
                 todo, root, store, stamps, skipped, units, failed, meta, truncated, progress)
         else:
             # Generations here too, so the store is serialised once per
-            # SILICA_INDEX_BATCH documents and not once per flush interval: a
-            # full rewrite of a large index every few seconds drowns the pass.
+            # SILICA_INDEX_BATCH documents and never on a timer: a full rewrite of
+            # a large index every few seconds drowns the pass it is meant to save.
             batch = _index_batch()
-            for start in range(0, len(todo), batch):
-                for done, (rel, mt) in enumerate(todo[start:start + batch], start + 1):
+            with contextlib.closing(_source_documents(todo, root)) as documents:
+                for done, (rel, mt, full) in enumerate(documents, 1):
                     if progress:
                         progress("index", done - 1, len(todo))
-                    result = _doc_result(rel, root)
-                    outcome = _apply_doc(store, result, mt, stamps, skipped, units, truncated)
-                    if outcome == "changed":
-                        changed += 1
-                    elif outcome == "failed":
-                        failed[rel] = result[2]
-                _flush(store, meta, failed)
+                    if isinstance(full, Exception):  # the source would not serve it
+                        failed[rel] = str(full)
+                    else:
+                        result = _doc_result(rel, root, full)
+                        outcome = _apply_doc(store, result, mt, stamps, skipped, units, truncated)
+                        if outcome == "changed":
+                            changed += 1
+                        elif outcome == "failed":
+                            failed[rel] = result[2]
+                    if done % batch == 0:
+                        _flush(store, meta, failed)
+                if len(todo) % batch:
+                    _flush(store, meta, failed)
         if progress and todo:
             progress("index", len(todo), len(todo))
         for gone in [p for p in list(stamps) + list(skipped) if p not in live]:
@@ -1783,15 +1837,20 @@ def _iso(ts: float) -> str:
 _section_cache: dict[tuple[str, float | int], tuple[str, list[tuple[int, str, Counter, int, str]]]] = {}
 
 
-def _sections_of(key: str) -> tuple[str, list[tuple[int, str, Counter, int, str]]]:
+def _sections_of(key: str, full: Path | None = None) -> tuple[str, list[tuple[int, str, Counter, int, str]]]:
     """Text and (offset, section, term counts, length, title) per section — a
     heading section in a note, a page in a PDF, a symbol in a source file —
     cached by identity stamp so a second query over the same top documents does
     not retokenize (nor re-extract), and a document replaced in place is not
     served from the cache. For a unit key (`path#offset`) the one unit,
-    with the whole file's text, so a line is counted from the file's start."""
+    with the whole file's text, so a line is counted from the file's start.
+
+    `full` is the path to read; the root-relative one by default. The index
+    pass passes a fetched copy when the bytes came over HTTP, so extraction
+    has one entry point either way.
+    """
     rel, unit = _split_key(key)
-    full = _root() / rel
+    full = full if full is not None else _root() / rel
     stamp = (rel, _identity_stamp(rel, full))
     if stamp not in _section_cache:
         if full.suffix.lower() == ".pdf":

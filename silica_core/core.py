@@ -805,8 +805,13 @@ def index_state(meta: dict | None = None, live: dict[str, float] | None = None) 
 
 def _flush(store, meta: dict, failed: dict) -> None:
     """Everything the build knows so far, on disk: the store, the stamps with
-    a `built_at` so the next run is incremental, the failures."""
-    store.save()
+    a `built_at` so the next run is incremental, the failures.
+
+    The store is written only when it holds something the file does not:
+    `save()` serialises every row, so a rewrite that changes nothing is pure
+    I/O — hundreds of megabytes per call on a large index."""
+    if store.is_dirty():
+        store.save()
     meta["built_at"] = time.time()
     _paths.atomic_write_bytes(_meta_path(), orjson.dumps(meta))
     _paths.atomic_write_bytes(_paths.index_dir() / "failures.json", orjson.dumps(failed))
@@ -854,53 +859,93 @@ def _max_drop() -> float:
     return frac if 0.0 <= frac <= 1.0 else 0.1
 
 
+def _verify_walk() -> bool:
+    """`SILICA_INVENTORY_VERIFY_WALK=1`: cross-walk the root on a manifest pass.
+
+    Off by default, and the default is the point of the manifest: a pass exists
+    so a large remote corpus can be indexed from a listing of paths and content
+    hashes without traversing anything. The walk here is a one-off verification
+    aid for an operator who suspects a short listing, not part of a normal
+    pass."""
+    return os.environ.get("SILICA_INVENTORY_VERIFY_WALK", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _merge_unextracted(*lists: list[str]) -> list[str]:
+    """The documents from several sources that hold no extracted text, each
+    named once, in first-seen order."""
+    return list(dict.fromkeys([rel for group in lists for rel in group]))
+
+
 def _guard_live(live: dict[str, float], unextracted: list[str], meta: dict,
-                errors: list[str] | None = None):
-    """The walk is the truth; a manifest is trusted only where it agrees with it.
+                errors: list[str] | None = None, manifest: dict | None = None):
+    """The manifest is the authority for a pass: it is returned with no walk.
 
-    A manifest that omits rows the walk can see is not a smaller corpus, it is a
-    broken or partial read of one, and a pass that removed its absent rows would
-    silently shrink the index (the empty-inventory defect). So on a
-    manifest-driven pass the walk is taken once more as the authority whenever
-    the two disagree, and the build then follows the walk.
+    The frames, in order:
 
-    A walk is usable only if it ran *and* listed every directory: `errors` (the
-    same list `_walk` appends to) holds the directories it could not list, and a
-    non-empty addition means the result is not a corpus — exactly as when the
-    walk raises and cannot run at all. `errors` defaults to the ambient list.
+    1. the manifest's `rel -> stamp` map IS the change key written into the
+       store. A stamp may be a content digest, and on a mount that reports no
+       mtimes the walk's `st_mtime` is 0.0 for every file, so a walk stamp is
+       not merely useless there — writing it made every document look changed
+       on every pass, re-queueing the whole corpus for ever;
+    2. the protection that defect needed is a stored-count comparison, not a
+       walk: if the manifest would remove more of the STORED rows than
+       `SILICA_INVENTORY_MAX_DROP` allows, it is a truncated or subset write
+       rather than a corpus that shrank, and the pass aborts with the
+       `inventory_prune_refused` error and the store byte-identical. That test
+       reads the manifest and the stored stamps, nothing else;
+    3. so a pass does not traverse at all. Every row the manifest names is in
+       the pass, stamped with the manifest's value, whether or not a filesystem
+       would list it — an object store's listing is the claim, and a row whose
+       file cannot be read now is recorded as a failure and retried, never
+       pruned. A row only a caller's own map names keeps that map's stamp.
 
-    When the walk is unusable — a manifest-only deployment, a share that is
-    down — the manifest is honoured only while it removes at most
-    `SILICA_INVENTORY_MAX_DROP` of the stored rows; past that the pass returns an
-    `inventory_prune_refused` error without writing, so the store is left
-    byte-identical and the caller sees the counts. The error carries `index`, so
-    a search that triggered this build serves the store it already has and
-    reports it stale rather than failing.
+    `SILICA_INVENTORY_VERIFY_WALK` is the single way to traverse on a manifest
+    pass, for an operator checking a listing. Even then the walk can only add
+    the rows the manifest omits: it never restamps, and an unusable walk (it
+    raised, or could not list a directory — `errors`) leaves the manifest's
+    answer standing rather than falling back to a partial one.
+
+    With no manifest (`manifest` None) this is not a manifest pass: `live` is
+    the walk's own answer and is returned as it is.
     """
+    if manifest is None:
+        manifest = _manifest_inventory()
+    if manifest is None:  # no manifest: there is nothing to reconcile against
+        return live, unextracted
+    stamps: dict[str, float] = meta.get("stamps", {})
+    skipped: dict[str, dict] = meta.get("no_text", {})
+    manifest_live: dict[str, float] = manifest["stamps"]
+    stored = len(stamps) + len(skipped)
+    drop = sum(1 for p in list(stamps) + list(skipped) if p not in manifest_live)
+    max_drop = _max_drop()
+    if stored and drop > max_drop * stored:
+        return _error("inventory_prune_refused",
+                      f"the manifest would remove {drop} of {stored} stored rows "
+                      f"(over {max_drop:.0%}); the index is left untouched",
+                      docs=len(stamps), changed=0, removed=drop, stored=stored,
+                      index=index_state(meta, live=live))
+    rows: dict[str, float] = dict(manifest_live)
+    for rel, st in live.items():
+        rows.setdefault(rel, st)
+    unextracted_out = _merge_unextracted(unextracted, manifest["unextracted"])
+    if not _verify_walk():
+        return dict(sorted(rows.items())), unextracted_out
     if errors is None:
         errors = _walk_failures.get() or []
     mark = len(errors)
-    stamps: dict[str, float] = meta.get("stamps", {})
-    skipped: dict[str, dict] = meta.get("no_text", {})
     walk_unextracted: list[str] = []
     try:
         walk_live, walk_unextracted = _inventory(base=_root())
     except Exception:
         walk_live = None
-    if walk_live is not None and len(errors) == mark:
-        if set(live) == set(walk_live) and set(unextracted) == set(walk_unextracted):
-            return live, unextracted
-        return walk_live, walk_unextracted
-    stored = len(stamps) + len(skipped)
-    drop = sum(1 for p in list(stamps) + list(skipped) if p not in live)
-    max_drop = _max_drop()
-    if stored and drop > max_drop * stored:
-        return _error("inventory_prune_refused",
-                      f"the walk is unavailable and the manifest would remove "
-                      f"{drop} of {stored} stored rows (over {max_drop:.0%}); the index is left untouched",
-                      docs=len(stamps), changed=0, removed=drop, stored=stored,
-                      index=index_state(meta, live=live))
-    return live, unextracted
+    if walk_live is None or len(errors) != mark:
+        # An unverifiable walk proves nothing: the manifest's answer stands.
+        return dict(sorted(rows.items())), unextracted_out
+    merged = {rel: manifest_live.get(rel, st) for rel, st in walk_live.items()}
+    for rel, st in manifest_live.items():
+        merged.setdefault(rel, st)  # named by the manifest but absent on disk: kept
+    return dict(sorted(merged.items())), _merge_unextracted(unextracted_out, walk_unextracted)
 
 
 def _index_processes() -> int:
@@ -1179,7 +1224,7 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
             # pass may remove at most `SILICA_INVENTORY_MAX_DROP` of the stored
             # rows and otherwise aborts before anything is written.
             errors.clear()  # only the guard's own walk counts
-            guarded = _guard_live(live, unextracted, meta, errors)
+            guarded = _guard_live(live, unextracted, meta, errors, manifest)
             if isinstance(guarded, dict):
                 return guarded
             live, unextracted = guarded

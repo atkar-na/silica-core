@@ -147,19 +147,22 @@ def test_a_manifest_for_another_root_or_a_short_count_falls_back_to_the_walk(roo
 # b. the prune guard
 # ---------------------------------------------------------------------------
 
-def test_a_subset_manifest_cannot_prune_the_index(root, tmp_path, monkeypatch):
-    """A manifest that omits rows the walk can see is not a smaller corpus, it is
-    a partial read of one: the walk is the authority and the rows stay."""
+def test_a_subset_manifest_is_refused_and_prunes_nothing(root, tmp_path, monkeypatch):
+    """A manifest that omits stored rows is a truncated or subset write, not a
+    smaller corpus. A manifest pass does not walk to rescue it: the stored-count
+    comparison refuses, and the index is left as it was."""
     root.build_index()
     assert root.index_state()["docs"] == 3
     stamps = root._load_meta()["stamps"]
     subset = {"version": 1, "root": str(root._root()), "count": 1,
               "stamps": {"docs/btree.md": stamps["docs/btree.md"]}}  # 1 of 3 stored rows
     monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, subset)))
+    monkeypatch.setattr(root, "_walk", _boom)  # a manifest pass must not traverse
 
     out = root.build_index()
 
-    assert "error" not in out, "the walk answers, so the pass proceeds rather than refusing"
+    assert out["error"]["code"] == "inventory_prune_refused"
+    assert out["removed"] == 2 and out["stored"] == 3
     assert set(root._load_meta()["stamps"]) == {"docs/btree.md", "docs/ctree.md", "docs/lsm.md"}, \
         "nothing was pruned"
     assert root.index_state()["docs"] == 3

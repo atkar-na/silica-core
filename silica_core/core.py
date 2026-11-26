@@ -6,6 +6,7 @@ code_pack, write_note. The CLI and the MCP server wrap these. Nothing here
 calls a model; the root is the folder Silica was started in (or --vault)."""
 from __future__ import annotations
 
+import contextvars
 import functools
 import hashlib
 import math
@@ -404,6 +405,16 @@ def _manifest_numbers(value: Any) -> dict[str, float]:
 
 
 def _manifest_inventory() -> dict | None:
+    """`_manifest_inventory_uncached()`, or the parse one public call already did.
+
+    See `_manifest_scoped`: a search or a listing resolves the manifest once and
+    every document it reads reuses that parse instead of re-reading the file.
+    """
+    scoped = _call_manifest.get()
+    return scoped[0] if scoped is not None else _manifest_inventory_uncached()
+
+
+def _manifest_inventory_uncached() -> dict | None:
     """The `SILICA_INVENTORY` manifest, parsed and checked against the frozen
     interface, or None when the variable is unset, unreadable or fails a rule
     (`version` is `1`, `root` equals the configured root, `count` matches
@@ -449,6 +460,39 @@ def _manifest_inventory() -> dict | None:
             "generated_at": data.get("generated_at")}
 
 
+_call_manifest: contextvars.ContextVar[tuple[dict | None] | None] = contextvars.ContextVar(
+    "silica_call_manifest", default=None)
+
+
+def _manifest_scoped(fn):
+    """Resolve the manifest once for one public call, and reuse that parse.
+
+    A search or a listing reads many documents, and every read asks for a
+    document's identity stamp; without this each one would re-read and
+    re-validate the manifest — tens of megabytes of JSON on the real corpus,
+    parsed once per hit. The scope is a ContextVar rather than a module global
+    because the MCP server serves requests on a thread pool: one request must
+    never read another request's manifest. The one-tuple is the sentinel —
+    `(None,)` means "resolved, and there is no manifest", which is not the same
+    as "not resolved yet".
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        token = _call_manifest.set((_manifest_inventory_uncached(),))
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _call_manifest.reset(token)
+
+    return wrapper
+
+
+def _manifest_stamps() -> dict[str, float] | None:
+    """The manifest's `rel -> stamp`, or None when no manifest is set."""
+    manifest = _manifest_inventory()
+    return manifest["stamps"] if manifest is not None else None
+
+
 def _identity_stamp(rel: str, full: Path) -> float | int:
     """A document's identity for the in-process caches: the manifest's stamp for
     `rel` when `SILICA_INVENTORY` supplies one, else the filesystem's own
@@ -457,10 +501,14 @@ def _identity_stamp(rel: str, full: Path) -> float | int:
     for equality only; on a mount whose mtime is constant (`--no-modtime`) the
     filesystem's stamp never moves, so only a manifest that carries a content
     digest can tell a replaced file from an untouched one. With no manifest the
-    value is the one the caches already used, so behaviour is unchanged."""
-    manifest = _manifest_inventory()
-    if manifest is not None:
-        stamp = manifest["stamps"].get(rel)
+    value is the one the caches already used, so behaviour is unchanged.
+
+    Inside a public call that resolved the manifest once (`_manifest_scoped`),
+    the stamp comes from that parse; outside one, this resolves it per call.
+    """
+    stamps = _manifest_stamps()
+    if stamps:
+        stamp = stamps.get(rel)
         if stamp is not None:
             return stamp
     return full.stat().st_mtime_ns
@@ -956,6 +1004,7 @@ def _manifest_page_row(row: dict, root: Path) -> None:
 
 
 @tool(cls="atomic")
+@_manifest_scoped
 def silica_files(
     folder: Annotated[str, Field(description="Root-relative folder to list; empty = the whole root")] = "",
     status: Annotated[str, Field(description="Only this status: indexed, changed, excluded, failed, unconverted")] = "",
@@ -1096,6 +1145,7 @@ def _sections_of(key: str) -> tuple[str, list[tuple[int, str, Counter, int, str]
 
 
 @tool(cls="atomic")
+@_manifest_scoped
 def silica_search(
     query: Annotated[str, Field(description="Concise question or description of the concept or behavior to find; preserve known names and identifiers")],
     folder: Annotated[str, Field(description="Only documents under this root-relative folder")] = "",
@@ -1443,6 +1493,7 @@ def version_of(path: str) -> str | None:
 
 
 @tool(cls="atomic")
+@_manifest_scoped
 def silica_read(
     path: Annotated[str, Field(description="Root-relative file path (from silica_files or a search hit)")],
     start: Annotated[int, Field(description="First line, 1-based")] = 1,

@@ -332,3 +332,27 @@ def test_unset_manifest_walks_and_the_rows_match_the_manifest(root, tmp_path, mo
     served = root.silica_files()
     assert sorted(served["files"], key=lambda r: r["path"]) == sorted(unset["files"], key=lambda r: r["path"])
     assert served["counts"] == unset["counts"] and served["total"] == unset["total"]
+
+
+# ---------------------------------------------------------------------------
+# e. one manifest parse per call that reads many documents
+# ---------------------------------------------------------------------------
+
+def test_one_manifest_parse_per_call(root, tmp_path, monkeypatch):
+    """A public call reads the manifest once however many documents it reads: the
+    call resolves it, and every identity stamp inside comes from that one parse."""
+    root.build_index()
+    monkeypatch.setenv("SILICA_INVENTORY", str(_write(tmp_path, _covering(root))))
+    monkeypatch.setattr(root, "_walk", _boom)
+    calls: list[int] = []
+    real = root._manifest_inventory_uncached
+    monkeypatch.setattr(root, "_manifest_inventory_uncached", lambda: (calls.append(1), real())[1])
+
+    hits = root.silica_search("amplification", k=3)
+    assert hits["hits"], "the store answers with no traversal"
+    assert len(calls) == 1, f"a query parsed the manifest {len(calls)} times, not once"
+    assert root._call_manifest.get() is None, "the scope is reset: the next request resolves its own"
+
+    listed = root.silica_files()
+    assert listed["total"] >= 3
+    assert len(calls) == 2, f"a listing parsed the manifest {len(calls) - 1} times, not once"

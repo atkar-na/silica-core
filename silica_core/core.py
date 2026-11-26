@@ -925,6 +925,7 @@ def _index_processes() -> int:
 # it (killed mid-pass, or the pool broke): the document keeps its old stamp or
 # none, so the next pass re-runs exactly it.
 _WORKER_DIED = "worker process died before this document was indexed"
+_WORKER_STALLED = "worker stalled past SILICA_INDEX_TIMEOUT and was abandoned"
 
 
 def _doc_result(rel: str, root: Path) -> tuple:
@@ -1011,6 +1012,32 @@ def _init_index_worker(root_str: str) -> None:
     _rpaths._PINNED.vault = root_str
 
 
+def _index_batch() -> int:
+    """Documents per pool generation: `SILICA_INDEX_BATCH`, default 256.
+
+    A batch ends with a store flush, so a long pass leaves progress on disk as
+    it goes and an interrupted run loses one batch, not the pass."""
+    try:
+        n = int(os.environ.get("SILICA_INDEX_BATCH", "256"))
+    except ValueError:
+        return 256
+    return n if n > 0 else 256
+
+
+def _index_timeout() -> float:
+    """Seconds one document may occupy a worker: `SILICA_INDEX_TIMEOUT`, default
+    300; 0 disables the limit.
+
+    A malformed PDF can send a parser into a loop that never returns. Without a
+    limit the parent waits on that result forever and the pass neither finishes
+    nor reports why."""
+    try:
+        t = float(os.environ.get("SILICA_INDEX_TIMEOUT", "300"))
+    except ValueError:
+        return 300.0
+    return t if t > 0 else 0.0
+
+
 def _index_parallel(todo: list[tuple[str, float]], root: Path, store, stamps: dict,
                     skipped: dict, units: dict, failed: dict, meta: dict,
                     progress) -> tuple[int, set[int]]:
@@ -1022,68 +1049,95 @@ def _index_parallel(todo: list[tuple[str, float]], root: Path, store, stamps: di
     futures is kept in flight rather than the whole `todo`, so a large corpus
     does not hold one Future per document.
 
+    The work is cut into generations of `SILICA_INDEX_BATCH` documents, each
+    flushed before the next opens, so progress survives a crash at batch
+    granularity and a long pass is observable while it runs.
+
     Crash safety: a worker that dies mid-pass makes the pool report
-    `BrokenProcessPool`. Every document not yet applied keeps its previous stamp
-    — or none — and is reported in `failed`; nothing is written for a document
-    the parent did not fully receive, so no row is partial and none is
-    duplicated, and the next pass re-runs exactly those documents. A single task
-    that raises (an unreadable file) fails only its own document and the pass
-    continues.
+    `BrokenProcessPool`; a worker stuck on one document is cut off after
+    `SILICA_INDEX_TIMEOUT` seconds. Either way the pool is torn down (a stalled
+    worker is terminated — a cancelled Future would leave it spinning and the
+    interpreter would wait on it at exit), the document is reported in `failed`
+    and the next generation starts in a fresh pool. Every document not fully
+    applied keeps its previous stamp, or none, so nothing is written for a
+    document the parent did not fully receive: no row is partial, none is
+    duplicated, and the next pass re-runs exactly those documents.
 
     Returns `(changed, worker_pids)`, mutating `failed` in place."""
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeout
     from concurrent.futures.process import BrokenProcessPool
 
     n = _index_processes()
+    batch = _index_batch()
+    timeout = _index_timeout() or None
     root_str = str(root)
-    items = [(rel, root_str) for rel, _mt in todo]
-    n_items = len(items)
     changed = 0
     pids: set[int] = set()
     last_flush = time.monotonic()
     window = max(4, n * 4)
-    broken = False
-    submitted = 0
-    in_flight: dict[int, Any] = {}
     # fork, explicitly: a worker inherits this build's root, config, index paths
     # and the SILICA_INVENTORY parse through copied memory, so nothing has to be
     # re-imported or re-resolved, and the tokenizer needs no warm-up.
     ctx = multiprocessing.get_context("fork")
-    with ProcessPoolExecutor(max_workers=n, mp_context=ctx,
-                             initializer=_init_index_worker, initargs=(root_str,)) as pool:
-        for i, (rel, mt) in enumerate(todo):
-            if not broken:
-                try:
-                    while submitted < min(i + window, n_items):
-                        in_flight[submitted] = pool.submit(_index_worker, items[submitted])
-                        submitted += 1
-                except BrokenProcessPool:
-                    broken = True
-            if progress:
-                progress("index", i, len(todo))
-            result = None
-            fut = in_flight.pop(i, None)
-            if not broken and fut is not None:
-                try:
-                    pid, result = fut.result()
-                except BrokenProcessPool:
-                    broken = True
-                except Exception as e:  # this document alone failed to read
-                    failed[rel] = f"{type(e).__name__}: {e}"
+    for start in range(0, len(todo), batch):
+        chunk = todo[start:start + batch]
+        items = [(rel, root_str) for rel, _mt in chunk]
+        n_items = len(items)
+        broken = False
+        submitted = 0
+        in_flight: dict[int, Any] = {}
+        pool = ProcessPoolExecutor(max_workers=n, mp_context=ctx,
+                                   initializer=_init_index_worker, initargs=(root_str,))
+        try:
+            for local, (rel, mt) in enumerate(chunk):
+                if not broken:
+                    try:
+                        while submitted < min(local + window, n_items):
+                            in_flight[submitted] = pool.submit(_index_worker, items[submitted])
+                            submitted += 1
+                    except BrokenProcessPool:
+                        broken = True
+                if progress:
+                    progress("index", start + local, len(todo))
+                fut = in_flight.pop(local, None)
+                if not broken and fut is not None:
+                    try:
+                        pid, result = fut.result(timeout=timeout)
+                    except FutureTimeout:
+                        broken = True
+                        failed[rel] = _WORKER_STALLED
+                        continue
+                    except BrokenProcessPool:
+                        broken = True
+                        failed[rel] = _WORKER_DIED
+                        continue
+                    except Exception as e:  # this document alone failed to read
+                        failed[rel] = f"{type(e).__name__}: {e}"
+                        continue
+                else:
+                    failed[rel] = _WORKER_DIED
                     continue
-            if broken or fut is None:
-                failed[rel] = _WORKER_DIED
-                continue
-            pids.add(pid)
-            outcome = _apply_doc(store, result, mt, stamps, skipped, units)
-            if outcome == "changed":
-                changed += 1
-            elif outcome == "failed":
-                failed[rel] = result[2]
-            if time.monotonic() - last_flush > _FLUSH_S:
-                _flush(store, meta, failed)
-                last_flush = time.monotonic()
+                pids.add(pid)
+                outcome = _apply_doc(store, result, mt, stamps, skipped, units)
+                if outcome == "changed":
+                    changed += 1
+                elif outcome == "failed":
+                    failed[rel] = result[2]
+                if time.monotonic() - last_flush > _FLUSH_S:
+                    _flush(store, meta, failed)
+                    last_flush = time.monotonic()
+        finally:
+            if broken:
+                pool.shutdown(wait=False, cancel_futures=True)
+                for child in multiprocessing.active_children():
+                    child.terminate()
+                    child.join(1)
+            else:
+                pool.shutdown(wait=True)
+        _flush(store, meta, failed)
+        last_flush = time.monotonic()
     return changed, pids
 
 

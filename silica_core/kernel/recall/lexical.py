@@ -176,6 +176,17 @@ def _tokens(text: str) -> list[str]:
     return out
 
 
+def _prepare(name: str, body: str) -> tuple[dict[str, int], int]:
+    """The token stream of one document as `(term -> count, token total)` for
+    `name` and `body` joined by a newline. Split out of `upsert` so a build can tokenize a document in a
+    worker process and hand the counts back to the single writer."""
+    toks = _tokens(f"{name}\n{body}")
+    tf: dict[str, int] = {}
+    for t in toks:
+        tf[t] = tf.get(t, 0) + 1
+    return tf, len(toks)
+
+
 class LexicalStore(DiskSynced):
     def __init__(self, path: Path | None = None):
         self._path = path if path is not None else _index_path()
@@ -209,14 +220,23 @@ class LexicalStore(DiskSynced):
         self._name_lower = {path: name.lower() for path, name in self._name.items()}
 
     def upsert(self, path: str, name: str, body: str) -> None:
+        tf, length = _prepare(name, body)
+        self._insert(path, name, tf, length)
+
+    def upsert_prepared(self, path: str, name: str, tf: dict[str, int], length: int) -> None:
+        """`upsert` with the tokenization already done.
+
+        A build with `SILICA_INDEX_PROCESSES` tokenizes each document in a
+        worker process and hands the counts back here; this stays the single
+        writer, so if it is fed the same documents in the same order the store
+        is byte-identical to a single-process build."""
+        self._insert(path, name, tf, length)
+
+    def _insert(self, path: str, name: str, tf: dict[str, int], length: int) -> None:
         if path in self._docs:
             self._unindex(path)
-        toks = _tokens(f"{name}\n{body}")
-        tf: dict[str, int] = {}
-        for t in toks:
-            tf[t] = tf.get(t, 0) + 1
         self._docs[path] = tf
-        self._len[path] = len(toks)
+        self._len[path] = length
         self._name[path] = name
         for term, f in tf.items():
             self._postings.setdefault(term, {})[path] = f
@@ -335,7 +355,13 @@ class LexicalStore(DiskSynced):
 
     def _serialize(self, snapshot) -> bytes:
         docs, lens, names = snapshot
-        return orjson.dumps({"docs": docs, "len": lens, "name": names})
+        # Canonical: the top-level maps go out in sorted path order, so the bytes
+        # depend on the set of documents and their token counts, never on the
+        # order a worker happened to finish in. Term order inside one document is
+        # fixed by `_tokens`, so the inner maps need no sort.
+        return orjson.dumps({"docs": {k: docs[k] for k in sorted(docs)},
+                             "len": {k: lens[k] for k in sorted(lens)},
+                             "name": {k: names[k] for k in sorted(names)}})
 
     def _dirty_sets(self) -> tuple[set[str], set[str]]:
         return (self._dirty, self._gone)

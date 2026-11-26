@@ -28,7 +28,7 @@ from silica_core.kernel.code.codeunits import outline as _code_outline
 from silica_core.kernel.code.codeunits import units as _code_units
 from silica_core.kernel.link.ast import parse_headings
 from silica_core.kernel.recall import paths as _paths
-from silica_core.kernel.recall.lexical import TOKENIZER_VERSION, _tokens, get_store
+from silica_core.kernel.recall.lexical import TOKENIZER_VERSION, _prepare, _tokens, get_store
 from silica_core.kernel.recall.rerank import _query_terms, best_window_spans
 from silica_core.tools import tool
 
@@ -903,6 +903,190 @@ def _guard_live(live: dict[str, float], unextracted: list[str], meta: dict,
     return live, unextracted
 
 
+def _index_processes() -> int:
+    """`SILICA_INDEX_PROCESSES`: worker processes for the first index pass.
+
+    Unset or 1 — the default — is a single process, today's behaviour. A value
+    above 1 distributes the read/extract/tokenize half of the pass across that
+    many worker processes (stdlib multiprocessing; threads are the wrong tool,
+    the tokenizer is GIL-bound). An unparseable or below-1 value is 1, so a typo
+    can never fan a build out."""
+    raw = os.environ.get("SILICA_INDEX_PROCESSES", "").strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError:
+        return 1
+    return n if n >= 1 else 1
+
+
+# Reason a document is reported failed when its worker process did not deliver
+# it (killed mid-pass, or the pool broke): the document keeps its old stamp or
+# none, so the next pass re-runs exactly it.
+_WORKER_DIED = "worker process died before this document was indexed"
+
+
+def _doc_result(rel: str, root: Path) -> tuple:
+    """The read, extract and tokenize half of the first pass for one document,
+    with no store mutation: a tagged tuple the caller applies.
+
+    Pure with respect to the store and the stamps, so a worker process produces
+    the same tuple the parent would, and the parent — the single writer — can
+    apply results in `todo` order whatever order the workers finish in.
+
+    Tags: `("prose", rel, name, tf, length)` a note or a PDF with a text layer;
+    `("units", rel, [(key, title, tf, length), ...])` a code file's symbols;
+    `("skip", rel, reason)` a PDF with no text layer; `("fail", rel, message)`
+    a document that could not be read."""
+    if rel.lower().endswith(".pdf"):
+        text, _pages, reason = _pdf_text(rel, root / rel)
+        if not text:  # a scan, or a PDF PDFium could not open: `unconverted`, never indexed
+            return ("skip", rel, reason)
+        tf, length = _prepare(Path(rel).stem, text)
+        return ("prose", rel, Path(rel).stem, tf, length)
+    if _is_code(rel):
+        try:
+            parts = _sections_of(rel)[1]
+        except OSError as e:
+            return ("fail", rel, str(e))
+        units = []
+        for off, part, _tf, _dl, title in parts:
+            u_tf, u_len = _prepare(title, part)
+            units.append((f"{rel}#{off}", title, u_tf, u_len))
+        return ("units", rel, units)
+    try:
+        text = _read(root / rel)
+    except OSError as e:
+        return ("fail", rel, str(e))
+    tf, length = _prepare(Path(rel).stem, text)
+    return ("prose", rel, Path(rel).stem, tf, length)
+
+
+def _apply_doc(store, result: tuple, mt: float, stamps: dict, skipped: dict,
+               units: dict) -> str:
+    """Apply one `_doc_result` to the store, the stamps and the unit map.
+
+    The single writer both the sequential and the parallel pass share, so the
+    two cannot drift: given the same documents in the same order the store lands
+    byte for byte the same. Returns `"changed"`, `"skipped"` or `"failed"` (the
+    failure message stays in `result`; the caller records it)."""
+    tag, rel = result[0], result[1]
+    if tag == "prose":
+        store.upsert_prepared(rel, result[2], result[3], result[4])
+        stamps[rel] = mt
+        skipped.pop(rel, None)
+        return "changed"
+    if tag == "units":
+        payload = result[2]
+        keys = [key for key, *_rest in payload]
+        for old in units.get(rel, []):
+            if old not in keys:
+                store.remove(old)
+        for key, title, tf, length in payload:
+            store.upsert_prepared(key, title, tf, length)
+        units[rel] = keys
+        stamps[rel] = mt
+        return "changed"
+    if tag == "skip":
+        skipped[rel] = {"mtime": mt, "reason": result[2]}
+        if stamps.pop(rel, None) is not None:
+            store.remove(rel)
+        return "skipped"
+    return "failed"
+
+
+def _index_worker(item: tuple[str, str]) -> tuple[int, tuple]:
+    """One document in a worker process: `(pid, _doc_result(...))`. The pid
+    rides back so the caller can see the fan-out actually happened."""
+    rel, root_str = item
+    return os.getpid(), _doc_result(rel, Path(root_str))
+
+
+def _init_index_worker(root_str: str) -> None:
+    """Pin the build's root in a worker process. A `fork` worker inherits it
+    already; pinning it here too keeps a worker's index dir, extraction cache
+    and manifest resolution tied to the same root under any start method."""
+    from silica_core.kernel.recall import paths as _rpaths
+    _rpaths._PINNED.vault = root_str
+
+
+def _index_parallel(todo: list[tuple[str, float]], root: Path, store, stamps: dict,
+                    skipped: dict, units: dict, failed: dict, meta: dict,
+                    progress) -> tuple[int, set[int]]:
+    """The first pass across `SILICA_INDEX_PROCESSES` worker processes.
+
+    Workers only read, extract and tokenize; every store mutation and every
+    stamp stays in this process, applied in `todo` order as results arrive in
+    that order, so no worker's finish time can reach the store. A window of
+    futures is kept in flight rather than the whole `todo`, so a large corpus
+    does not hold one Future per document.
+
+    Crash safety: a worker that dies mid-pass makes the pool report
+    `BrokenProcessPool`. Every document not yet applied keeps its previous stamp
+    — or none — and is reported in `failed`; nothing is written for a document
+    the parent did not fully receive, so no row is partial and none is
+    duplicated, and the next pass re-runs exactly those documents. A single task
+    that raises (an unreadable file) fails only its own document and the pass
+    continues.
+
+    Returns `(changed, worker_pids)`, mutating `failed` in place."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures.process import BrokenProcessPool
+
+    n = _index_processes()
+    root_str = str(root)
+    items = [(rel, root_str) for rel, _mt in todo]
+    n_items = len(items)
+    changed = 0
+    pids: set[int] = set()
+    last_flush = time.monotonic()
+    window = max(4, n * 4)
+    broken = False
+    submitted = 0
+    in_flight: dict[int, Any] = {}
+    # fork, explicitly: a worker inherits this build's root, config, index paths
+    # and the SILICA_INVENTORY parse through copied memory, so nothing has to be
+    # re-imported or re-resolved, and the tokenizer needs no warm-up.
+    ctx = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=n, mp_context=ctx,
+                             initializer=_init_index_worker, initargs=(root_str,)) as pool:
+        for i, (rel, mt) in enumerate(todo):
+            if not broken:
+                try:
+                    while submitted < min(i + window, n_items):
+                        in_flight[submitted] = pool.submit(_index_worker, items[submitted])
+                        submitted += 1
+                except BrokenProcessPool:
+                    broken = True
+            if progress:
+                progress("index", i, len(todo))
+            result = None
+            fut = in_flight.pop(i, None)
+            if not broken and fut is not None:
+                try:
+                    pid, result = fut.result()
+                except BrokenProcessPool:
+                    broken = True
+                except Exception as e:  # this document alone failed to read
+                    failed[rel] = f"{type(e).__name__}: {e}"
+                    continue
+            if broken or fut is None:
+                failed[rel] = _WORKER_DIED
+                continue
+            pids.add(pid)
+            outcome = _apply_doc(store, result, mt, stamps, skipped, units)
+            if outcome == "changed":
+                changed += 1
+            elif outcome == "failed":
+                failed[rel] = result[2]
+            if time.monotonic() - last_flush > _FLUSH_S:
+                _flush(store, meta, failed)
+                last_flush = time.monotonic()
+    return changed, pids
+
+
 def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, float] | None = None,
                  allow_remote: bool = False, progress: Callable[[str, int, int], None] | None = None) -> dict:
     """Build or refresh the document index. Incremental by mtime; `rebuild`
@@ -969,45 +1153,27 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         last_flush = time.monotonic()
         todo = [(rel, mt) for rel, mt in live.items()
                 if rebuild or not (stamps.get(rel) == mt or skipped.get(rel, {}).get("mtime") == mt)]
-        for done, (rel, mt) in enumerate(todo, 1):
-            if progress:
-                progress("index", done - 1, len(todo))
-            if rel.lower().endswith(".pdf"):
-                text, _pages, reason = _pdf_text(rel, root / rel)
-                if not text:  # a scan, or a PDF PDFium could not open: `unconverted`, never indexed
-                    skipped[rel] = {"mtime": mt, "reason": reason}
-                    if stamps.pop(rel, None) is not None:
-                        store.remove(rel)
-                    continue
-            elif _is_code(rel):
-                try:
-                    parts = _sections_of(rel)[1]
-                except OSError as e:
-                    failed[rel] = str(e)
-                    continue
-                keys = [f"{rel}#{off}" for off, *_rest in parts]
-                for old in units.get(rel, []):
-                    if old not in keys:
-                        store.remove(old)
-                for (off, part, _tf, _dl, title), key in zip(parts, keys):
-                    store.upsert(key, title, part)
-                units[rel] = keys
-                stamps[rel] = mt
-                changed += 1
-                continue
-            else:
-                try:
-                    text = _read(root / rel)
-                except OSError as e:
-                    failed[rel] = str(e)
-                    continue
-            store.upsert(rel, Path(rel).stem, text)
-            stamps[rel] = mt
-            skipped.pop(rel, None)
-            changed += 1
-            if time.monotonic() - last_flush > _FLUSH_S:
-                _flush(store, meta, failed)
-                last_flush = time.monotonic()
+        n_proc = _index_processes()
+        worker_pids: set[int] = set()
+        if n_proc > 1 and len(todo) > 1:
+            # The opt-in fan-out: workers read/extract/tokenize, this process
+            # applies every result in `todo` order as the single writer, so a
+            # worker's finish time cannot reorder the store.
+            changed, worker_pids = _index_parallel(
+                todo, root, store, stamps, skipped, units, failed, meta, progress)
+        else:
+            for done, (rel, mt) in enumerate(todo, 1):
+                if progress:
+                    progress("index", done - 1, len(todo))
+                result = _doc_result(rel, root)
+                outcome = _apply_doc(store, result, mt, stamps, skipped, units)
+                if outcome == "changed":
+                    changed += 1
+                elif outcome == "failed":
+                    failed[rel] = result[2]
+                if time.monotonic() - last_flush > _FLUSH_S:
+                    _flush(store, meta, failed)
+                    last_flush = time.monotonic()
         if progress and todo:
             progress("index", len(todo), len(todo))
         for gone in [p for p in list(stamps) + list(skipped) if p not in live]:
@@ -1024,6 +1190,10 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
                  "built_at": meta["built_at"], "pending": len(failed),
                  "inventory": _inventory_block(live)}
         out = {"docs": len(stamps), "changed": changed, "failed": failed, "index": state}
+        if worker_pids:
+            # Present only when the fan-out ran: a single-process pass carries no
+            # such key, so `SILICA_INDEX_PROCESSES` unset and `=1` stay identical.
+            out["parallel"] = {"processes": n_proc, "workers": len(worker_pids)}
     if embed:
         from silica_core import embeddings
         if not embeddings.enabled():

@@ -24,7 +24,8 @@ def root(tmp_path, monkeypatch):
 
 
 def test_state_counts_pending_and_a_small_drift_is_refreshed_inline(root, tmp_path):
-    assert root.build_index()["index"] == {"state": "ready", "docs": 3, "built_at": pytest.approx(root._load_meta()["built_at"]), "pending": 0}
+    assert root.build_index()["index"] == {"state": "ready", "docs": 3, "built_at": pytest.approx(root._load_meta()["built_at"]), "pending": 0,
+                                           "inventory": {"source": "walk", "root": str(root._root()), "generated_at": None, "count": 3}}
     (tmp_path / "n3.md").write_text("# Note 3\n\ncompaction again\n", encoding="utf-8")
     (tmp_path / "n0.md").unlink()
     assert root.index_state()["pending"] == 2  # one new, one gone

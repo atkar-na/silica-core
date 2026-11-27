@@ -227,6 +227,85 @@ def _conversion_of(md_full: Path, text: str) -> tuple[str | None, str | None]:
     return None, "unverifiable"
 
 
+def _conversion_sidecar(rel: str, root: Path) -> tuple[str, int] | None:
+    """`(sidecar rel, stamp)` for a manifest document row `rel` a conversion
+    wrote a `.md` beside, or None.
+
+    The pairing is the walk's own: the same stem and a `.md` suffix, read from
+    the container view under `root` — where `silica-core import` writes the
+    sidecar, even when the manifest was built from a listing (a bucket listing,
+    a sync) that never covered it. It applies only to a row the walk reads
+    through a sidecar, a suffix in `DOC_EXTS` (a PDF, an office file, an image,
+    media); a prose note or a code file is read as itself and gets no sidecar.
+
+    The stamp is the sidecar's OWN content — `digest_stamp()` of its sha1
+    hexdigest, the same 48-bit integer the manifest uses — so a conversion that
+    changes re-indexes even when the original is byte-for-byte the same, and a
+    store stamped this way stays directly comparable with manifest stamps.
+
+    None when no sidecar sits beside the row, when the original is gone, when
+    the sidecar cannot be read, or when `_source_state()` calls it `stale`: the
+    conversion's own hash says the bytes beside it have changed, so its text is
+    not adopted. Each of those leaves the row its ordinary manifest handling —
+    never a crash, and never a row dropped from the pass.
+    """
+    from silica_core.inventory import digest_stamp
+    from silica_core.sources.convert import DOC_EXTS
+
+    if Path(rel).suffix.lower() not in DOC_EXTS:
+        return None
+    full = root / rel
+    sidecar = full.with_suffix(".md")
+    if not sidecar.is_file() or not full.is_file():
+        return None
+    try:
+        raw = sidecar.read_bytes()
+    except OSError:
+        return None
+    if _source_state(full, raw.decode("utf-8", "replace")) == "stale":
+        return None
+    return sidecar.relative_to(root).as_posix(), digest_stamp(hashlib.sha1(raw).hexdigest())
+
+
+def _sidecar_documents(stamps: dict[str, float],
+                       unextracted: list[str],
+                       root: Path) -> tuple[dict[str, float], list[str]]:
+    """The manifest's document set with conversion sidecars honoured.
+
+    A manifest holds the documents a listing names — a PDF, an office file —
+    but not the `.md` a later `silica-core import` wrote beside one, because
+    the conversion lands in a view the listing never saw. The walk has no such
+    gap: it indexes the sidecar and reads the document through it. This maps
+    each such document row to its sidecar, so a manifest-driven pass indexes
+    the SAME text the walk does, under the SAME key (the sidecar path).
+
+    Precedence: the sidecar's own content digest is the stamp, whether the
+    document row carried it or the manifest also named the sidecar path as a
+    row of its own — the two resolve to one key, so the document appears
+    exactly once. A manifest row the walk reads as itself (a prose note, a code
+    file) is copied through untouched; an `unextracted` document that gains a
+    sidecar moves into the stamped set, since it now has text to index.
+
+    With no sidecar present this is the identity on both sets, so a manifest
+    pass with no sidecars is byte-for-byte the pass it always was.
+    """
+    out = dict(stamps)
+    kept: list[str] = []
+    for rel in unextracted:
+        got = _conversion_sidecar(rel, root)
+        if got is None:
+            kept.append(rel)
+        else:
+            out[got[0]] = got[1]
+    for rel in list(stamps):
+        got = _conversion_sidecar(rel, root)
+        if got is None:
+            continue
+        out.pop(rel, None)
+        out[got[0]] = got[1]
+    return dict(sorted(out.items())), kept
+
+
 def _head(full: Path, limit: int = 65536) -> str:
     """The first `limit` characters: enough for any frontmatter, and a listing
     must not read every note whole to ask whether it is a conversion."""
@@ -845,9 +924,28 @@ def index_state(meta: dict | None = None, live: dict[str, float] | None = None) 
         walk_failed = bool(failures)
     stamps = meta.get("stamps", {})
     skipped = meta.get("no_text", {})
-    pending = sum(1 for r, mt in live.items()
-                  if stamps.get(r) != mt and skipped.get(r, {}).get("mtime") != mt)
-    pending += sum(1 for r in stamps if r not in live)
+    # A manifest row whose conversion wrote a `.md` beside it is indexed under
+    # the sidecar's path, not the document's, so the store's key differs from
+    # the manifest's by design (see `_sidecar_documents`). Recognise it here:
+    # a row the store answers for through its sidecar is not pending, and the
+    # sidecar row itself is not a deletion. The sidecar is read only for a row
+    # the plain comparison already flagged — a handful on a caught-up index —
+    # so the freshness check stays as cheap as it was.
+    sidecar_rows: set[str] = set()
+    manifest = _manifest_inventory()
+    root = _root()
+    pending = 0
+    for r, mt in live.items():
+        if stamps.get(r) == mt or skipped.get(r, {}).get("mtime") == mt:
+            continue
+        if manifest is not None:
+            got = _conversion_sidecar(r, root)
+            if got is not None:
+                sidecar_rows.add(got[0])
+                if stamps.get(got[0]) == got[1]:
+                    continue
+        pending += 1
+    pending += sum(1 for r in stamps if r not in live and r not in sidecar_rows)
     out = {"state": "stale" if (pending or walk_failed) else "ready", "docs": len(stamps),
            "built_at": meta.get("built_at"), "pending": pending,
            "inventory": _inventory_block(live)}
@@ -1457,6 +1555,15 @@ def _build_index(rebuild: bool = False, embed: bool = False, live: dict[str, flo
         else:
             unextracted = manifest["unextracted"] if manifest is not None else []
         if manifest is not None:
+            # A manifest names the documents a listing held; a `silica-core
+            # import` writes its converted `.md` beside an original, into a view
+            # the listing never covered, so the row is the document, not the
+            # note the index should read. Re-derive the walk's pairing here —
+            # before the prune guard, so the guard judges the same document set
+            # the pass indexes — and index the converted text exactly as the
+            # walk does, keyed by the sidecar and stamped from its own content.
+            live, unextracted = _sidecar_documents(live, unextracted, root)
+            manifest = {**manifest, "stamps": live, "unextracted": unextracted}
             # Prune guard, on the incremental *and* the rebuild path: the walk is
             # the authority, and a manifest that disagrees with it — a subset, a
             # truncated write, a stale file — is replaced by the walk's own set
